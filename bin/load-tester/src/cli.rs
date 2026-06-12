@@ -1,13 +1,6 @@
 //! CLI argument parsing and execution for the load tester binary.
 
-use std::{
-    path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
-};
+use std::{path::PathBuf, time::Duration};
 
 use alloy_network::{EthereumWallet, TransactionBuilder};
 use alloy_primitives::{Address, U256, utils::format_ether};
@@ -16,15 +9,13 @@ use alloy_rpc_types::{BlockNumberOrTag, TransactionRequest};
 use alloy_signer_local::PrivateKeySigner;
 use base_cli_utils::RuntimeManager;
 use base_load_tests::{
-    AccountPool, BaselineError, FundedAccount, LoadRunner, LoadTestDisplay, MetricsSummary,
-    QueryProvider, RealTokenSetup, Result as LoadResult, RpcProviders, RpcResultExt, TestConfig,
-    create_wallet_provider,
+    AccountPool, BaselineError, FundedAccount, LoadRunner, LoadTestDisplay, QueryProvider,
+    Result as LoadResult, RpcProviders, RpcResultExt, TestConfig, create_wallet_provider,
 };
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use eyre::{Result, bail};
 use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 /// Accounts to derive and check per batch during rescue.
@@ -221,45 +212,20 @@ async fn run_load_test(args: LoadArgs) -> Result<()> {
     );
     println!();
 
-    let funding_amount = test_config.parse_funding_amount()?;
-    let swap_token_amount = test_config.parse_swap_token_amount()?;
-    let b20_mint_amount = test_config.parse_b20_mint_amount()?;
-    let real_token_setup = test_config.parse_real_token_setup(load_config.chain_id)?;
-
-    let config_summary = test_config.to_summary();
-    let mut runner = LoadRunner::new(load_config.clone())?;
-    runner.set_config_summary(config_summary.clone());
-
-    // Install signal handling before any long-running work so shutdown can
-    // stop the run loop and still drain funded accounts.
-    let stop_flag = runner.stop_flag();
-    install_signal_handler(stop_flag);
-
-    let run_result = run_test_phases(
-        &mut runner,
-        &funding_key,
-        SetupAmounts {
-            funding: funding_amount,
-            swap_token: swap_token_amount,
-            b20_mint: b20_mint_amount,
+    println!("Running load test...");
+    let display = LoadTestDisplay::new(&mp, load_config.duration);
+    let output = base_load_tests::LoadTestExecutor::run_with_display(
+        test_config,
+        base_load_tests::LoadTestRunOptions {
+            continuous: args.continuous,
+            install_signal_handler: true,
+            ..Default::default()
         },
-        real_token_setup.as_ref(),
-        &mp,
-        load_config.duration,
+        Some(display),
     )
-    .await;
-
-    let (summary, run_err) = match run_result {
-        Ok(summary) => (summary, None),
-        Err(e) => {
-            let summary = MetricsSummary {
-                config: Some(config_summary),
-                error: Some(e.to_string()),
-                ..Default::default()
-            };
-            (summary, Some(e))
-        }
-    };
+    .await?;
+    let summary = output.summary;
+    let run_err = summary.error.clone();
 
     if summary.error.is_none() || summary.throughput.total_submitted > 0 {
         println!();
@@ -389,91 +355,27 @@ async fn run_load_test(args: LoadArgs) -> Result<()> {
         }
     }
 
-    // Brief cooldown so in-flight load-test transactions can land and
-    // mempool state settles before we query balances for the drain.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    if runner.needs_b20_setup() {
-        println!("Burning remaining B-20 tokens...");
-        match runner.teardown_b20_tokens().await {
-            Ok(()) => println!("B-20 teardown complete."),
-            Err(e) => eprintln!("Warning: B-20 teardown failed: {e}"),
+    if output.cleanup.b20_teardown_attempted {
+        match &output.cleanup.b20_teardown_error {
+            None => println!("B-20 teardown complete."),
+            Some(error) => eprintln!("Warning: B-20 teardown failed: {error}"),
         }
     }
 
-    println!();
-    println!("Draining accounts back to funder...");
-    match runner.drain_accounts(funding_key).await {
-        Ok(drained) => println!("Drained {} ETH back to funder.", format_ether(drained)),
-        Err(e) => eprintln!("Warning: drain failed: {e}"),
+    match output.cleanup.drained {
+        Some(drained) => println!("Drained {} ETH back to funder.", format_ether(drained)),
+        None => {
+            if let Some(error) = &output.cleanup.drain_error {
+                eprintln!("Warning: drain failed: {error}");
+            }
+        }
     }
 
-    if let Some(e) = run_err {
-        return Err(e.into());
+    if let Some(error) = run_err {
+        bail!("{error}");
     }
 
     Ok(())
-}
-
-struct SetupAmounts {
-    funding: U256,
-    swap_token: U256,
-    b20_mint: U256,
-}
-
-/// Runs funding, token setup, and the load test loop, returning the metrics summary.
-async fn run_test_phases(
-    runner: &mut LoadRunner,
-    funding_key: &PrivateKeySigner,
-    amounts: SetupAmounts,
-    real_token_setup: Option<&RealTokenSetup>,
-    mp: &indicatif::MultiProgress,
-    duration: Option<Duration>,
-) -> LoadResult<MetricsSummary> {
-    if runner.txpool_node_count() > 0 {
-        println!("Clearing txpool sender transactions...");
-        let removed = runner.clear_txpools().await?;
-        println!("Txpool clearing complete. Removed {removed} transaction(s).");
-    }
-
-    println!("Funding test accounts...");
-    runner.fund_accounts(funding_key.clone(), amounts.funding).await?;
-    println!("Accounts funded.");
-
-    if let Some(setup) = real_token_setup {
-        println!("Preparing real-token swap balances...");
-        runner.setup_real_tokens(setup).await?;
-        println!("Real-token swap balances prepared.");
-    } else if !runner.collect_swap_tokens().is_empty() {
-        println!("Distributing swap tokens...");
-        runner.setup_swap_tokens(funding_key.clone(), amounts.swap_token).await?;
-        println!("Swap tokens distributed.");
-    }
-
-    if runner.needs_b20_setup() {
-        println!("Setting up B-20 tokens...");
-        runner.setup_b20_tokens(funding_key.clone(), amounts.b20_mint).await?;
-        println!("B-20 tokens ready.");
-    }
-    println!();
-
-    println!("Running load test...");
-
-    let display = LoadTestDisplay::new(mp, duration);
-    runner.set_display(display);
-
-    runner.run().await
-}
-
-fn install_signal_handler(stop_flag: Arc<AtomicBool>) {
-    let cancel = CancellationToken::new();
-    RuntimeManager::install_signal_handler(cancel.clone());
-
-    tokio::spawn(async move {
-        cancel.cancelled().await;
-        eprintln!("\nReceived signal, stopping gracefully.");
-        stop_flag.store(true, Ordering::SeqCst);
-    });
 }
 
 // ---------------------------------------------------------------------------

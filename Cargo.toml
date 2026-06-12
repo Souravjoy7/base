@@ -227,10 +227,10 @@ base-flashblocks-node = { path = "crates/execution/flashblocks-node" }
 basectl-cli = { path = "crates/infra/basectl" }
 audit-archiver-lib = { path = "crates/infra/audit" }
 base-load-tests = { path = "crates/infra/load-tests" }
+base-zk-benchmarks = { path = "crates/infra/zk-benchmarks" }
 ingress-rpc-lib = { path = "crates/infra/ingress-rpc" }
 base-snapshotter = { path = "crates/infra/snapshotter" }
 websocket-proxy = { path = "crates/infra/websocket-proxy" }
-base-zk-benchmarks = { path = "crates/infra/zk-benchmarks" }
 
 # Proof
 base-proof-rpc = { path = "crates/proof/rpc" }

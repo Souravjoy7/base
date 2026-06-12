@@ -1,6 +1,6 @@
 [package]
 name = "base-zk-benchmarks"
-description = "ZK proving benchmark scenarios for Base devnets"
+description = "ZK proof benchmarking for Base load-test runs"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,3 +10,20 @@ repository.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+# alloy
+alloy-eips.workspace = true
+alloy-primitives.workspace = true
+
+# base
+base-zk-client.workspace = true
+base-load-tests.workspace = true
+base-optimism-rpc.workspace = true
+
+# misc
+url.workspace = true
+eyre.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["time"] }
+serde = { workspace = true, features = ["derive"] }

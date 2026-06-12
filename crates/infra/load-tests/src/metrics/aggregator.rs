@@ -1,11 +1,11 @@
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
 use serde::{Deserialize, Serialize};
 
 use super::{
-    BlockRange, ConfigSummary, FlashblocksLatencyMetrics, GasMetrics, LatencyMetrics,
-    ObservedWindowMetrics, SubmissionStats, TailMetrics, ThroughputMetrics, ThroughputPercentiles,
-    ThroughputSample, TransactionMetrics, types::BLOCK_INTERVAL,
+    BlockLoadMetrics, BlockRange, ConfigSummary, FlashblocksLatencyMetrics, GasMetrics,
+    LatencyMetrics, ObservedWindowMetrics, SubmissionStats, TailMetrics, ThroughputMetrics,
+    ThroughputPercentiles, ThroughputSample, TransactionMetrics, types::BLOCK_INTERVAL,
 };
 
 /// Aggregates raw transaction metrics into summary statistics.
@@ -82,6 +82,7 @@ impl<'a> MetricsAggregator<'a> {
             throughput_timeseries: throughput_samples.to_vec(),
             gas: Self::compute_gas(self.transactions),
             block_range,
+            block_load: Self::compute_block_load(self.transactions),
             top_failure_reasons,
         }
     }
@@ -310,6 +311,24 @@ impl<'a> MetricsAggregator<'a> {
         }
     }
 
+    /// Computes per-block load density for confirmed transactions.
+    pub fn compute_block_load(transactions: &[TransactionMetrics]) -> Vec<BlockLoadMetrics> {
+        let mut blocks = BTreeMap::<u64, BlockLoadMetrics>::new();
+        for transaction in transactions {
+            let Some(block_number) = transaction.block_number else {
+                continue;
+            };
+            let block = blocks.entry(block_number).or_insert_with(|| BlockLoadMetrics {
+                block_number,
+                ..BlockLoadMetrics::default()
+            });
+            block.confirmed_count += 1;
+            block.reverted_count += u64::from(transaction.reverted);
+            block.total_gas += transaction.gas_used;
+        }
+        blocks.into_values().collect()
+    }
+
     fn compute_throughput_percentiles(
         tps_samples: &[f64],
         gps_samples: &[f64],
@@ -390,6 +409,8 @@ pub struct MetricsSummary {
     pub gas: GasMetrics,
     /// Range of blocks containing confirmed test transactions.
     pub block_range: BlockRange,
+    /// Per-block load density for confirmed test transactions.
+    pub block_load: Vec<BlockLoadMetrics>,
     /// Top failure reasons sorted by count descending (max 3).
     pub top_failure_reasons: Vec<(String, u64)>,
 }
