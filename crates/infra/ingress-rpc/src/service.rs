@@ -11,9 +11,15 @@ use audit_archiver_lib::BundleEvent;
 use base_bundles::{AcceptedBundle, Bundle, BundleExtensions, MeterBundleResponse, ParsedBundle};
 use base_common_consensus::{BaseTxEnvelope, EIP8130_REJECTION_MSG};
 use base_common_network::Base;
+use base_observability_events::{
+    EventIdBuilder, TransactionEvent, TransactionEventProducer, TransactionEventType,
+    TransactionEventWriter,
+};
+use chrono::Utc;
 use jsonrpsee::{
     core::{RpcResult, async_trait},
     proc_macros::rpc,
+    types::ErrorObjectOwned,
 };
 use moka::future::Cache;
 use reth_rpc_eth_types::EthApiError;
@@ -23,8 +29,9 @@ use tokio::{
     time::{Duration, Instant, timeout},
 };
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
-use crate::{Config, metrics::Metrics};
+use crate::{Config, MeteringForwardMessage, metrics::Metrics};
 
 /// RPC providers for different endpoints.
 #[derive(Debug)]
@@ -53,9 +60,10 @@ pub struct IngressService {
     send_transaction_default_lifetime_seconds: u64,
     block_time_milliseconds: u64,
     meter_bundle_timeout_ms: u64,
-    builder_tx: broadcast::Sender<MeterBundleResponse>,
+    builder_tx: broadcast::Sender<MeteringForwardMessage>,
     bundle_cache: Cache<B256, ()>,
     send_to_builder: bool,
+    transaction_event_writer: TransactionEventWriter,
 }
 
 impl std::fmt::Debug for IngressService {
@@ -69,8 +77,27 @@ impl IngressService {
     pub fn new(
         providers: Providers,
         audit_channel: mpsc::Sender<BundleEvent>,
-        builder_tx: broadcast::Sender<MeterBundleResponse>,
+        builder_tx: broadcast::Sender<MeteringForwardMessage>,
         config: Config,
+    ) -> Self {
+        let transaction_event_writer =
+            TransactionEventWriter::disabled(config.transaction_event_writer_config());
+        Self::new_with_transaction_event_writer(
+            providers,
+            audit_channel,
+            builder_tx,
+            config,
+            transaction_event_writer,
+        )
+    }
+
+    /// Creates a new ingress service with an explicit transaction event writer.
+    pub fn new_with_transaction_event_writer(
+        providers: Providers,
+        audit_channel: mpsc::Sender<BundleEvent>,
+        builder_tx: broadcast::Sender<MeteringForwardMessage>,
+        config: Config,
+        transaction_event_writer: TransactionEventWriter,
     ) -> Self {
         let mempool_provider = Arc::new(providers.mempool);
         let simulation_provider = Arc::new(providers.simulation);
@@ -91,6 +118,7 @@ impl IngressService {
             builder_tx,
             bundle_cache,
             send_to_builder: config.send_to_builder,
+            transaction_event_writer,
         }
     }
 }
@@ -100,20 +128,55 @@ impl IngressApiServer for IngressService {
     async fn send_raw_transaction(&self, data: Bytes) -> RpcResult<B256> {
         let start = Instant::now();
         let transaction = self.get_tx(&data).await?;
+        let tx_hash = transaction.tx_hash();
 
         Metrics::transactions_received().increment(1);
+        self.emit_transaction_event(TransactionEventType::IngressReceived, tx_hash, None, None);
 
         // Forward before metering
         if let Some(forward_provider) = self.raw_tx_forward_provider.clone() {
             Metrics::raw_tx_forwards_total().increment(1);
             let tx_data = data.clone();
-            let tx_hash = transaction.tx_hash();
+            let writer = self.transaction_event_writer.clone();
+            Self::emit_transaction_event_with_data(
+                &writer,
+                TransactionEventType::IngressTxForwardAttempt,
+                tx_hash,
+                None,
+                None,
+                serde_json::Map::from_iter([(
+                    "target".to_string(),
+                    serde_json::json!("raw_tx_forward"),
+                )]),
+            );
             tokio::spawn(async move {
                 match forward_provider.send_raw_transaction(tx_data.iter().as_slice()).await {
                     Ok(_) => {
+                        Self::emit_transaction_event_with_data(
+                            &writer,
+                            TransactionEventType::IngressTxForwardSuccess,
+                            tx_hash,
+                            None,
+                            None,
+                            serde_json::Map::from_iter([(
+                                "target".to_string(),
+                                serde_json::json!("raw_tx_forward"),
+                            )]),
+                        );
                         debug!(message = "Forwarded raw tx", hash = %tx_hash);
                     }
                     Err(e) => {
+                        Self::emit_transaction_event_with_data(
+                            &writer,
+                            TransactionEventType::IngressTxForwardFailure,
+                            tx_hash,
+                            None,
+                            None,
+                            serde_json::Map::from_iter([
+                                ("target".to_string(), serde_json::json!("raw_tx_forward")),
+                                ("error".to_string(), serde_json::json!(e.to_string())),
+                            ]),
+                        );
                         warn!(message = "Failed to forward raw tx", hash = %tx_hash, error = %e);
                     }
                 }
@@ -147,21 +210,43 @@ impl IngressApiServer for IngressService {
             self.bundle_cache.insert(*bundle_hash, ()).await;
             Metrics::bundles_parsed().increment(1);
 
+            self.emit_transaction_event(
+                TransactionEventType::SimulationStarted,
+                tx_hash,
+                Some(*bundle_hash),
+                None,
+            );
+            let simulation_start = Instant::now();
             let meter_bundle_response: Option<MeterBundleResponse> = match self
                 .meter_bundle(&bundle, bundle_hash)
                 .await
             {
                 Ok(response) => {
+                    self.emit_simulation_event(
+                        TransactionEventType::SimulationSucceeded,
+                        tx_hash,
+                        *bundle_hash,
+                        simulation_start.elapsed(),
+                        &response,
+                        None,
+                    );
                     info!(message = "Metering succeeded for raw transaction", bundle_hash = %bundle_hash, response = ?response);
                     Some(response)
                 }
                 Err(e) => {
+                    self.emit_simulation_rejected_event(
+                        tx_hash,
+                        *bundle_hash,
+                        simulation_start.elapsed(),
+                        e.error.to_string(),
+                        e.metering.as_ref(),
+                    );
                     warn!(
                         bundle_hash = %bundle_hash,
-                        error = %e,
+                        error = %e.error,
                         "Metering failed for raw transaction"
                     );
-                    None
+                    e.metering
                 }
             };
 
@@ -170,7 +255,11 @@ impl IngressApiServer for IngressService {
                 // Update the current size of the `builder_tx` channel captured right before sending to the builder
                 Metrics::buffered_meter_bundle_responses_size().set(self.builder_tx.len() as f64);
                 if self.send_to_builder {
-                    match self.builder_tx.send(meter_info.clone()) {
+                    let message = MeteringForwardMessage {
+                        tx_hashes: vec![tx_hash],
+                        response: meter_info.clone(),
+                    };
+                    match self.builder_tx.send(message) {
                         Ok(n) => debug!(
                             receivers = n,
                             bundle_hash = %bundle_hash,
@@ -190,13 +279,31 @@ impl IngressApiServer for IngressService {
             let accepted_bundle =
                 AcceptedBundle::new(parsed_bundle, meter_bundle_response.unwrap_or_default());
 
+            self.emit_transaction_event(
+                TransactionEventType::IngressTxForwardAttempt,
+                tx_hash,
+                Some(*bundle_hash),
+                Some(*accepted_bundle.uuid()),
+            );
             let response = self.mempool_provider.send_raw_transaction(data.iter().as_slice()).await;
             match response {
                 Ok(_) => {
                     Metrics::sent_to_mempool().increment(1);
+                    self.emit_transaction_event(
+                        TransactionEventType::IngressTxForwardSuccess,
+                        tx_hash,
+                        Some(*bundle_hash),
+                        Some(*accepted_bundle.uuid()),
+                    );
                     debug!(message = "sent transaction to the mempool", hash=%transaction.tx_hash());
                 }
                 Err(e) => {
+                    self.emit_forward_nack_event(
+                        tx_hash,
+                        *bundle_hash,
+                        *accepted_bundle.uuid(),
+                        e.to_string(),
+                    );
                     warn!(message = "Failed to send raw transaction to mempool", error = %e);
                 }
             }
@@ -250,7 +357,7 @@ impl IngressService {
         &self,
         bundle: &Bundle,
         bundle_hash: &B256,
-    ) -> RpcResult<MeterBundleResponse> {
+    ) -> Result<MeterBundleResponse, MeterBundleFailure> {
         let start = Instant::now();
         let timeout_duration = Duration::from_millis(self.meter_bundle_timeout_ms);
 
@@ -266,9 +373,15 @@ impl IngressService {
         .await
         .map_err(|_| {
             warn!(message = "Timed out on requesting metering", bundle_hash = %bundle_hash);
-            EthApiError::InvalidParams("Timeout on requesting metering".into()).into_rpc_err()
+            MeterBundleFailure::without_response(
+                EthApiError::InvalidParams("Timeout on requesting metering".into()).into_rpc_err(),
+            )
         })?
-        .map_err(|e| EthApiError::InvalidParams(e.to_string()).into_rpc_err())?;
+        .map_err(|e| {
+            MeterBundleFailure::without_response(
+                EthApiError::InvalidParams(e.to_string()).into_rpc_err(),
+            )
+        })?;
 
         Metrics::rpc_latency("base_meterBundle").record(start.elapsed().as_secs_f64());
 
@@ -277,9 +390,10 @@ impl IngressService {
         let total_execution_time = (res.total_execution_time_us / 1_000) as u64;
         if total_execution_time > self.block_time_milliseconds {
             Metrics::bundles_exceeded_metering_time().increment(1);
-            return Err(
-                EthApiError::InvalidParams("Bundle simulation took too long".into()).into_rpc_err()
-            );
+            return Err(MeterBundleFailure::with_response(
+                EthApiError::InvalidParams("Bundle simulation took too long".into()).into_rpc_err(),
+                res,
+            ));
         }
         Ok(res)
     }
@@ -309,6 +423,179 @@ impl IngressService {
                 );
             }
         }
+    }
+
+    fn emit_transaction_event(
+        &self,
+        event_type: TransactionEventType,
+        tx_hash: B256,
+        bundle_hash: Option<B256>,
+        bundle_id: Option<Uuid>,
+    ) {
+        Self::emit_transaction_event_with_data(
+            &self.transaction_event_writer,
+            event_type,
+            tx_hash,
+            bundle_hash,
+            bundle_id,
+            serde_json::Map::new(),
+        );
+    }
+
+    fn emit_simulation_event(
+        &self,
+        event_type: TransactionEventType,
+        tx_hash: B256,
+        bundle_hash: B256,
+        duration: Duration,
+        metering: &MeterBundleResponse,
+        rejection_reason: Option<String>,
+    ) {
+        let mut data = metering_summary_data(bundle_hash, None, metering);
+        data.insert(
+            "simulation_duration_ms".to_string(),
+            serde_json::json!(duration.as_secs_f64() * 1000.0),
+        );
+        if let Some(reason) = rejection_reason {
+            data.insert("rejection_reason".to_string(), serde_json::json!(reason));
+        }
+
+        Self::emit_transaction_event_with_data(
+            &self.transaction_event_writer,
+            event_type,
+            tx_hash,
+            Some(bundle_hash),
+            None,
+            data,
+        );
+    }
+
+    fn emit_simulation_rejected_event(
+        &self,
+        tx_hash: B256,
+        bundle_hash: B256,
+        duration: Duration,
+        reason: String,
+        metering: Option<&MeterBundleResponse>,
+    ) {
+        let mut data = if let Some(metering) = metering {
+            metering_summary_data(bundle_hash, None, metering)
+        } else {
+            serde_json::Map::from_iter([(
+                "bundle_hash".to_string(),
+                serde_json::json!(bundle_hash.to_string()),
+            )])
+        };
+        data.extend([
+            (
+                "simulation_duration_ms".to_string(),
+                serde_json::json!(duration.as_secs_f64() * 1000.0),
+            ),
+            ("rejection_reason".to_string(), serde_json::json!(reason)),
+        ]);
+        data.insert("rejection_code".to_string(), serde_json::json!("simulation_error"));
+        Self::emit_transaction_event_with_data(
+            &self.transaction_event_writer,
+            TransactionEventType::SimulationFailed,
+            tx_hash,
+            Some(bundle_hash),
+            None,
+            data,
+        );
+    }
+
+    fn emit_forward_nack_event(
+        &self,
+        tx_hash: B256,
+        bundle_hash: B256,
+        bundle_id: Uuid,
+        reason: String,
+    ) {
+        Self::emit_transaction_event_with_data(
+            &self.transaction_event_writer,
+            TransactionEventType::IngressTxForwardFailure,
+            tx_hash,
+            Some(bundle_hash),
+            Some(bundle_id),
+            serde_json::Map::from_iter([
+                ("target".to_string(), serde_json::json!("mempool")),
+                ("rejection_reason".to_string(), serde_json::json!(reason)),
+            ]),
+        );
+    }
+
+    fn emit_transaction_event_with_data(
+        writer: &TransactionEventWriter,
+        event_type: TransactionEventType,
+        tx_hash: B256,
+        bundle_hash: Option<B256>,
+        bundle_id: Option<Uuid>,
+        mut data: serde_json::Map<String, serde_json::Value>,
+    ) {
+        if let Some(bundle_hash) = bundle_hash {
+            data.entry("bundle_hash".to_string())
+                .or_insert_with(|| serde_json::json!(bundle_hash.to_string()));
+        }
+        if let Some(bundle_id) = bundle_id {
+            data.entry("bundle_id".to_string())
+                .or_insert_with(|| serde_json::json!(bundle_id.to_string()));
+        }
+
+        let event_time = Utc::now();
+        let event_id = EventIdBuilder::new()
+            .part("producer", TransactionEventProducer::IngressRpc)
+            .part("event_type", event_type)
+            .part("tx_hash", tx_hash)
+            .part("event_time", event_time.timestamp_nanos_opt().unwrap_or_default())
+            .finish();
+
+        let event = TransactionEvent::new(
+            event_id,
+            event_time,
+            TransactionEventProducer::IngressRpc,
+            event_type,
+        )
+        .with_network(writer.network())
+        .with_tx_hash(tx_hash)
+        .with_data(data);
+
+        if let Err(err) = writer.try_write(&event) {
+            debug!(error = %err, event_type = %event_type, tx_hash = %tx_hash, "transaction event not written");
+        }
+    }
+}
+
+fn metering_summary_data(
+    bundle_hash: B256,
+    bundle_id: Option<Uuid>,
+    metering: &MeterBundleResponse,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut data = serde_json::Map::from_iter([(
+        "bundle_hash".to_string(),
+        serde_json::json!(bundle_hash.to_string()),
+    )]);
+    if let Some(bundle_id) = bundle_id {
+        data.insert("bundle_id".to_string(), serde_json::json!(bundle_id.to_string()));
+    }
+    if let Ok(metering_response) = serde_json::to_value(metering) {
+        data.insert("meter_bundle_response".to_string(), metering_response);
+    }
+    data
+}
+
+#[derive(Debug)]
+struct MeterBundleFailure {
+    error: ErrorObjectOwned,
+    metering: Option<MeterBundleResponse>,
+}
+
+impl MeterBundleFailure {
+    fn without_response(error: ErrorObjectOwned) -> Self {
+        Self { error, metering: None }
+    }
+
+    fn with_response(error: ErrorObjectOwned, metering: MeterBundleResponse) -> Self {
+        Self { error, metering: Some(metering) }
     }
 }
 
@@ -349,7 +636,26 @@ mod tests {
             audit_batch_max_wait_ms: 1000,
             audit_rpc_timeout_secs: 5,
             audit_rpc_url: Url::parse("http://localhost:9000").unwrap(),
+            transaction_events_enabled: false,
+            transaction_events_file_path: "/tmp/transaction-events.jsonl".into(),
+            transaction_events_queue_capacity: 1024,
+            transaction_events_flush_interval_ms: 1000,
+            transaction_events_required: false,
+            transaction_events_network: "base-mainnet".to_string(),
         }
+    }
+
+    #[test]
+    fn metering_summary_data_includes_full_meter_bundle_response() {
+        let metering = create_test_meter_bundle_response();
+        let data = metering_summary_data(metering.bundle_hash, None, &metering);
+
+        assert_eq!(data["bundle_hash"], serde_json::json!(metering.bundle_hash.to_string()));
+        assert_eq!(data["meter_bundle_response"], serde_json::to_value(&metering).unwrap());
+        assert!(!data.contains_key("results"));
+        assert!(!data.contains_key("state_block_number"));
+        assert!(!data.contains_key("total_gas_used"));
+        assert!(!data.contains_key("total_execution_time_us"));
     }
 
     #[tokio::test]
