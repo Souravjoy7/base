@@ -4770,7 +4770,6 @@ dependencies = [
  "base-observability-events",
  "base-test-utils",
  "c-kzg",
- "chrono",
  "derive_more 2.1.1",
  "futures",
  "jsonrpsee",

@@ -49,7 +49,6 @@ c-kzg.workspace = true
 futures.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
-chrono.workspace = true
 tokio-util.workspace = true
 async-trait.workspace = true
 derive_more.workspace = true
