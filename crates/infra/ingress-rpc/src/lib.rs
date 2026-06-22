@@ -27,7 +27,7 @@ use base_bundles::MeterBundleResponse;
 use base_common_network::Base;
 use base_observability_events::{
     DEFAULT_FLUSH_INTERVAL, DEFAULT_QUEUE_CAPACITY, TransactionEventProducer, TransactionEventType,
-    TransactionEventWriter, TransactionEventWriterConfig, transaction_event,
+    TransactionEventWriterConfig, transaction_event,
 };
 use clap::Args;
 use serde_json::{Map, json};
@@ -206,7 +206,6 @@ impl BuilderConnector {
         metering_rx: broadcast::Receiver<MeteringForwardMessage>,
         builder_rpc: Url,
         destination_index: usize,
-        transaction_event_writer: TransactionEventWriter,
     ) {
         let rpc_url = builder_rpc.clone();
         let builder: RootProvider<Base> = RootProvider::new_http(builder_rpc);
@@ -230,7 +229,6 @@ impl BuilderConnector {
                         if event.results.is_empty() {
                             for tx_hash in &message.tx_hashes {
                                 emit_metering_send_event(
-                                    &transaction_event_writer,
                                     TransactionEventType::IngressMeteringSendDropped,
                                     Some(*tx_hash),
                                     Some(event.bundle_hash),
@@ -261,10 +259,8 @@ impl BuilderConnector {
                         };
                         let builder = builder.clone();
                         let url = rpc_url.clone();
-                        let writer = transaction_event_writer.clone();
                         join_set.spawn(async move {
                             emit_metering_send_event(
-                                &writer,
                                 TransactionEventType::IngressMeteringSendAttempt,
                                 Some(tx_hash),
                                 Some(bundle_hash),
@@ -281,7 +277,6 @@ impl BuilderConnector {
                             {
                                 Ok(()) => {
                                     emit_metering_send_event(
-                                        &writer,
                                         TransactionEventType::IngressMeteringSendSuccess,
                                         Some(tx_hash),
                                         Some(bundle_hash),
@@ -296,7 +291,6 @@ impl BuilderConnector {
                                 }
                                 Err(e) => {
                                     emit_metering_send_event(
-                                        &writer,
                                         TransactionEventType::IngressMeteringSendFailure,
                                         Some(tx_hash),
                                         Some(bundle_hash),
@@ -342,7 +336,6 @@ impl BuilderConnector {
 }
 
 fn emit_metering_send_event(
-    writer: &TransactionEventWriter,
     event_type: TransactionEventType,
     tx_hash: Option<TxHash>,
     bundle_hash: Option<alloy_primitives::B256>,
@@ -357,7 +350,6 @@ fn emit_metering_send_event(
     data.entry("destination_index".to_string()).or_insert_with(|| json!(destination_index));
 
     if let Err(err) = transaction_event!(
-        writer: Some(writer),
         producer: TransactionEventProducer::IngressRpc,
         event_type: event_type,
         maybe_tx_hash: tx_hash,
@@ -377,21 +369,10 @@ mod tests {
 
     use alloy_primitives::{Address, TxHash, U256};
     use base_bundles::{MeterBundleResponse, TransactionResult};
-    use base_observability_events::{
-        TransactionEventProducer, TransactionEventWriter, TransactionEventWriterConfig,
-    };
     use tokio::sync::broadcast;
     use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
     use super::{BuilderConnector, MeteringForwardMessage};
-
-    fn disabled_writer() -> TransactionEventWriter {
-        TransactionEventWriter::disabled(TransactionEventWriterConfig::disabled(
-            TransactionEventProducer::IngressRpc,
-            "base-devnet",
-            "/tmp/transaction-events.jsonl",
-        ))
-    }
 
     fn response_with_results() -> MeterBundleResponse {
         MeterBundleResponse {
@@ -450,7 +431,7 @@ mod tests {
         }
 
         // Start the connector with the already-lagged receiver.
-        BuilderConnector::connect(rx, mock_server.uri().parse().unwrap(), 0, disabled_writer());
+        BuilderConnector::connect(rx, mock_server.uri().parse().unwrap(), 0);
 
         // Give the connector time to hit Lagged and recover.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -478,7 +459,7 @@ mod tests {
         Mock::given(method("POST")).respond_with(jsonrpc_ok()).expect(1).mount(&mock_server).await;
 
         let (tx, rx) = broadcast::channel::<MeteringForwardMessage>(16);
-        BuilderConnector::connect(rx, mock_server.uri().parse().unwrap(), 0, disabled_writer());
+        BuilderConnector::connect(rx, mock_server.uri().parse().unwrap(), 0);
 
         tx.send(forwarding_message(response_with_results())).unwrap();
 
@@ -493,7 +474,7 @@ mod tests {
         Mock::given(method("POST")).respond_with(jsonrpc_ok()).expect(0).mount(&mock_server).await;
 
         let (tx, rx) = broadcast::channel::<MeteringForwardMessage>(16);
-        BuilderConnector::connect(rx, mock_server.uri().parse().unwrap(), 0, disabled_writer());
+        BuilderConnector::connect(rx, mock_server.uri().parse().unwrap(), 0);
 
         // Default response has empty results — should be skipped.
         tx.send(forwarding_message(MeterBundleResponse::default())).unwrap();
@@ -516,7 +497,7 @@ mod tests {
             .await;
 
         let (tx, rx) = broadcast::channel::<MeteringForwardMessage>(16);
-        BuilderConnector::connect(rx, mock_server.uri().parse().unwrap(), 0, disabled_writer());
+        BuilderConnector::connect(rx, mock_server.uri().parse().unwrap(), 0);
 
         for _ in 0..5 {
             tx.send(forwarding_message(response_with_results())).unwrap();
@@ -535,7 +516,7 @@ mod tests {
         Mock::given(method("POST")).respond_with(jsonrpc_ok()).expect(1).mount(&mock_server).await;
 
         let (tx, rx) = broadcast::channel::<MeteringForwardMessage>(16);
-        BuilderConnector::connect(rx, mock_server.uri().parse().unwrap(), 0, disabled_writer());
+        BuilderConnector::connect(rx, mock_server.uri().parse().unwrap(), 0);
 
         // Send one message, then close the channel.
         tx.send(forwarding_message(response_with_results())).unwrap();

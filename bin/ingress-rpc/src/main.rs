@@ -6,7 +6,7 @@ use alloy_provider::RootProvider;
 use audit_archiver_lib::{AuditConnector, BundleEvent, RpcBundleEventPublisher};
 use base_cli_utils::LogConfig;
 use base_common_network::Base;
-use base_observability_events::TransactionEventWriter;
+use base_observability_events::init_global_transaction_event_writer;
 use clap::Parser;
 use ingress_rpc_lib::{
     BuilderConnector, Config, HealthServer, IngressApiServer, IngressService,
@@ -66,10 +66,9 @@ async fn main() -> anyhow::Result<()> {
         raw_tx_forward: config.raw_tx_forward_rpc.clone().map(RootProvider::<Base>::new_http),
     };
 
-    let transaction_event_writer =
-        TransactionEventWriter::from_config(config.transaction_event_writer_config())
-            .await
-            .map_err(|err| anyhow::anyhow!("{err}"))?;
+    init_global_transaction_event_writer(Some(config.transaction_event_writer_config()))
+        .await
+        .map_err(|err| anyhow::anyhow!("{err}"))?;
 
     let audit_publisher = RpcBundleEventPublisher::new(
         config.audit_rpc_url.as_str(),
@@ -92,12 +91,7 @@ async fn main() -> anyhow::Result<()> {
     );
     config.builder_rpcs.iter().enumerate().for_each(|(destination_index, builder_rpc)| {
         let metering_rx = builder_tx.subscribe();
-        BuilderConnector::connect(
-            metering_rx,
-            builder_rpc.clone(),
-            destination_index,
-            transaction_event_writer.clone(),
-        );
+        BuilderConnector::connect(metering_rx, builder_rpc.clone(), destination_index);
     });
 
     let health_check_addr = config.health_check_addr;
@@ -108,13 +102,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let bind_addr = format!("{}:{}", config.address, config.port);
-    let service = IngressService::new_with_transaction_event_writer(
-        providers,
-        audit_tx,
-        builder_tx,
-        cli.config,
-        transaction_event_writer,
-    );
+    let service = IngressService::new(providers, audit_tx, builder_tx, cli.config);
 
     let server = Server::builder().build(&bind_addr).await?;
     let addr = server.local_addr()?;

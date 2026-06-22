@@ -12,7 +12,7 @@ use base_bundles::{AcceptedBundle, Bundle, BundleExtensions, MeterBundleResponse
 use base_common_consensus::{BaseTxEnvelope, EIP8130_REJECTION_MSG};
 use base_common_network::Base;
 use base_observability_events::{
-    TransactionEventProducer, TransactionEventType, TransactionEventWriter, transaction_event,
+    TransactionEventProducer, TransactionEventType, transaction_event,
 };
 use jsonrpsee::{
     core::{RpcResult, async_trait},
@@ -61,7 +61,6 @@ pub struct IngressService {
     builder_tx: broadcast::Sender<MeteringForwardMessage>,
     bundle_cache: Cache<B256, ()>,
     send_to_builder: bool,
-    transaction_event_writer: TransactionEventWriter,
 }
 
 impl std::fmt::Debug for IngressService {
@@ -77,25 +76,6 @@ impl IngressService {
         audit_channel: mpsc::Sender<BundleEvent>,
         builder_tx: broadcast::Sender<MeteringForwardMessage>,
         config: Config,
-    ) -> Self {
-        let transaction_event_writer =
-            TransactionEventWriter::disabled(config.transaction_event_writer_config());
-        Self::new_with_transaction_event_writer(
-            providers,
-            audit_channel,
-            builder_tx,
-            config,
-            transaction_event_writer,
-        )
-    }
-
-    /// Creates a new ingress service with an explicit transaction event writer.
-    pub fn new_with_transaction_event_writer(
-        providers: Providers,
-        audit_channel: mpsc::Sender<BundleEvent>,
-        builder_tx: broadcast::Sender<MeteringForwardMessage>,
-        config: Config,
-        transaction_event_writer: TransactionEventWriter,
     ) -> Self {
         let mempool_provider = Arc::new(providers.mempool);
         let simulation_provider = Arc::new(providers.simulation);
@@ -116,7 +96,6 @@ impl IngressService {
             builder_tx,
             bundle_cache,
             send_to_builder: config.send_to_builder,
-            transaction_event_writer,
         }
     }
 }
@@ -135,9 +114,7 @@ impl IngressApiServer for IngressService {
         if let Some(forward_provider) = self.raw_tx_forward_provider.clone() {
             Metrics::raw_tx_forwards_total().increment(1);
             let tx_data = data.clone();
-            let writer = self.transaction_event_writer.clone();
             Self::emit_transaction_event_with_data(
-                &writer,
                 TransactionEventType::IngressTxForwardAttempt,
                 tx_hash,
                 None,
@@ -151,7 +128,6 @@ impl IngressApiServer for IngressService {
                 match forward_provider.send_raw_transaction(tx_data.iter().as_slice()).await {
                     Ok(_) => {
                         Self::emit_transaction_event_with_data(
-                            &writer,
                             TransactionEventType::IngressTxForwardSuccess,
                             tx_hash,
                             None,
@@ -165,7 +141,6 @@ impl IngressApiServer for IngressService {
                     }
                     Err(e) => {
                         Self::emit_transaction_event_with_data(
-                            &writer,
                             TransactionEventType::IngressTxForwardFailure,
                             tx_hash,
                             None,
@@ -431,7 +406,6 @@ impl IngressService {
         bundle_id: Option<Uuid>,
     ) {
         Self::emit_transaction_event_with_data(
-            &self.transaction_event_writer,
             event_type,
             tx_hash,
             bundle_hash,
@@ -458,14 +432,7 @@ impl IngressService {
             data.insert("rejection_reason".to_string(), serde_json::json!(reason));
         }
 
-        Self::emit_transaction_event_with_data(
-            &self.transaction_event_writer,
-            event_type,
-            tx_hash,
-            Some(bundle_hash),
-            None,
-            data,
-        );
+        Self::emit_transaction_event_with_data(event_type, tx_hash, Some(bundle_hash), None, data);
     }
 
     fn emit_simulation_rejected_event(
@@ -494,7 +461,6 @@ impl IngressService {
         ]);
         data.insert("rejection_code".to_string(), serde_json::json!("simulation_error"));
         Self::emit_transaction_event_with_data(
-            &self.transaction_event_writer,
             TransactionEventType::SimulationFailed,
             tx_hash,
             Some(bundle_hash),
@@ -511,7 +477,6 @@ impl IngressService {
         reason: String,
     ) {
         Self::emit_transaction_event_with_data(
-            &self.transaction_event_writer,
             TransactionEventType::IngressTxForwardFailure,
             tx_hash,
             Some(bundle_hash),
@@ -524,7 +489,6 @@ impl IngressService {
     }
 
     fn emit_transaction_event_with_data(
-        writer: &TransactionEventWriter,
         event_type: TransactionEventType,
         tx_hash: B256,
         bundle_hash: Option<B256>,
@@ -541,7 +505,6 @@ impl IngressService {
         }
 
         if let Err(err) = transaction_event!(
-            writer: Some(writer),
             producer: TransactionEventProducer::IngressRpc,
             event_type: event_type,
             tx_hash: tx_hash,
