@@ -6,7 +6,7 @@ use alloy_provider::RootProvider;
 use audit_archiver_lib::{AuditConnector, BundleEvent, RpcBundleEventPublisher};
 use base_cli_utils::LogConfig;
 use base_common_network::Base;
-use base_observability_events::init_global_transaction_event_writer;
+use base_observability_events::GlobalTransactionEventWriter;
 use clap::Parser;
 use ingress_rpc_lib::{
     BuilderConnector, Config, HealthServer, IngressApiServer, IngressService,
@@ -66,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
         raw_tx_forward: config.raw_tx_forward_rpc.clone().map(RootProvider::<Base>::new_http),
     };
 
-    init_global_transaction_event_writer(Some(config.transaction_event_writer_config()))
+    GlobalTransactionEventWriter::init(Some(config.transaction_event_writer_config()))
         .await
         .map_err(|err| anyhow::anyhow!("{err}"))?;
 
