@@ -317,7 +317,9 @@ mod tests {
     use alloy_hardforks::ForkCondition;
     use alloy_primitives::{Address, B256, Bytes, Signature, U256, address, keccak256, uint};
     use base_common_chains::{BaseUpgradeExt, ChainUpgrades};
-    use base_common_consensus::{BaseReceiptEnvelope, BaseTxEnvelope, Eip8130Signed, Predeploys, TxEip8130};
+    use base_common_consensus::{
+        BaseReceiptEnvelope, BaseTxEnvelope, Eip8130Signed, Predeploys, TxEip8130,
+    };
     use base_common_genesis::BaseUpgrade;
     use k256::ecdsa::SigningKey;
     use revm::{
@@ -407,7 +409,8 @@ mod tests {
             metadata: Bytes::new(),
             payer: None,
         };
-        let signed = Eip8130Signed::new(tx.clone(), eoa_sig(&key, tx.sender_signature_hash()), Bytes::new());
+        let signed =
+            Eip8130Signed::new(tx.clone(), eoa_sig(&key, tx.sender_signature_hash()), Bytes::new());
         let recovered = Recovered::new_unchecked(BaseTxEnvelope::Eip8130(signed), sender);
         let tx_with_encoded = WithEncoded::new(recovered.encoded_2718().into(), recovered);
 
@@ -441,8 +444,12 @@ mod tests {
                 cfg.chain_id = CHAIN_ID;
             });
         let evm = ctx.build_with_inspector(NoOpInspector {});
-        let mut executor =
-            BaseBlockExecutor::new(evm, BaseBlockExecutionCtx::default(), &upgrades, &receipt_builder);
+        let mut executor = BaseBlockExecutor::new(
+            evm,
+            BaseBlockExecutionCtx::default(),
+            &upgrades,
+            &receipt_builder,
+        );
 
         executor
             .execute_transaction(&tx_with_encoded)
