@@ -3,6 +3,7 @@ target/
 .idea/
 .DS_Store
 .devnet/
+.prover-service/
 .zk-prover/
 .sisyphus/
 eif*.bin
