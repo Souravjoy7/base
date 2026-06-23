@@ -3386,6 +3386,7 @@ dependencies = [
  "base-builder-metering",
  "base-bundles",
  "base-node-core",
+ "base-observability-events",
  "clap",
  "eyre",
  "humantime",
