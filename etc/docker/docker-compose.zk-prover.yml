@@ -1,15 +1,15 @@
 services:
-  zk-prover-postgres:
+  prover-service-postgres:
     image: postgres:17-alpine
     ports:
-      - "${ZK_PROVER_POSTGRES_PORT:-5433}:5432"
+      - "${PROVER_SERVICE_POSTGRES_PORT:-5433}:5432"
     environment:
       - POSTGRES_DB=prover
       - POSTGRES_USER=prover
       - POSTGRES_PASSWORD=prover
     volumes:
-      - ../../.zk-prover/${ZK_PROVER_NETWORK:-local}/postgres:/var/lib/postgresql/data
-      - ../../crates/proof/zk/db/migrations:/docker-entrypoint-initdb.d:ro
+      - ../../.prover-service/${PROVER_SERVICE_NETWORK:-local}/postgres:/var/lib/postgresql/data
+      - ../../crates/proof/prover-service/db/migrations:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U prover -d prover"]
       interval: 250ms
@@ -18,21 +18,56 @@ services:
       start_period: 250ms
     restart: unless-stopped
 
-  base-prover-zk:
-    image: base-prover-zk:local
+  base-prover-service:
+    image: base-prover-service:local
+    build:
+      context: ../..
+      dockerfile: etc/docker/Dockerfile.rust-services
+      args:
+        PROFILE: "${PROVER_SERVICE_PROFILE:-release}"
+      target: prover-service
+    depends_on:
+      prover-service-postgres:
+        condition: service_healthy
+    ports:
+      - "${PROVER_SERVICE_RPC_PORT:-9000}:9000"
+      - "${PROVER_SERVICE_WORKER_RPC_PORT:-9001}:9001"
+    environment:
+      - RPC_LISTEN_ADDR=0.0.0.0:9000
+      - WORKER_RPC_LISTEN_ADDR=0.0.0.0:9001
+      - RUST_LOG=${RUST_LOG:-}
+      - POSTGRES_HOST=prover-service-postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=prover
+      - POSTGRES_USER=prover
+      - POSTGRES_PASSWORD=prover
+      - POSTGRES_SSLMODE=disable
+      - OTEL_SERVICE_NAME=base-prover-service-${PROVER_SERVICE_NETWORK:-local}
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/localhost/9000"]
+      interval: 250ms
+      timeout: 1s
+      retries: 240
+      start_period: 250ms
+    restart: unless-stopped
+
+  base-prover-zk-host:
+    image: base-prover-zk-host:local
     build:
       context: ../..
       dockerfile: etc/docker/Dockerfile.rust-services
       args:
         PROFILE: "${ZK_PROVER_PROFILE:-release}"
-      target: zk-prover
+        BASE_SUCCINCT_ELF_REQUIRE: "${BASE_SUCCINCT_ELF_REQUIRE:-1}"
+      target: zk-host
     depends_on:
-      zk-prover-postgres:
+      base-prover-service:
         condition: service_healthy
-    ports:
-      - "${ZK_PROVER_GRPC_PORT:-9000}:9000"
     environment:
-      - SP1_PROVER=${SP1_PROVER:-dry-run}
+      - PROVER_SERVICE_ENDPOINT=http://base-prover-service:9001
+      - PROVER_WORKER_ID=${PROVER_WORKER_ID:-standalone-zk-host-compressed}
+      - PROOF_TYPE=${PROOF_TYPE:-compressed}
+      - ZK_BACKEND=${ZK_BACKEND:-dry_run}
       - SP1_CLUSTER_API_ENDPOINT=${SP1_CLUSTER_API_ENDPOINT:-}
       - SP1_CLUSTER_TIMEOUT_HOURS=${SP1_CLUSTER_TIMEOUT_HOURS:-24}
       - CLI_S3_BUCKET=${CLI_S3_BUCKET:-}
@@ -42,25 +77,11 @@ services:
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
       - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN:-}
-      - PROXY_ENABLE=${PROXY_ENABLE:-false}
       - RUST_LOG=${RUST_LOG:-}
-      - GRPC_LISTEN_ADDR=0.0.0.0:9000
       - BASE_CONSENSUS_ADDRESS=${BASE_CONSENSUS_ADDRESS:-}
       - L1_NODE_ADDRESS=${L1_NODE_ADDRESS:-}
       - L1_BEACON_ADDRESS=${L1_BEACON_ADDRESS:-}
       - L2_NODE_ADDRESS=${L2_NODE_ADDRESS:-}
       - DEFAULT_SEQUENCE_WINDOW=${DEFAULT_SEQUENCE_WINDOW:-50}
-      - POSTGRES_HOST=zk-prover-postgres
-      - POSTGRES_PORT=5432
-      - POSTGRES_DB=prover
-      - POSTGRES_USER=prover
-      - POSTGRES_PASSWORD=prover
-      - POSTGRES_SSLMODE=disable
-      - OTEL_SERVICE_NAME=base-prover-zk-${ZK_PROVER_NETWORK:-local}
-    healthcheck:
-      test: ["CMD", "bash", "-c", "echo > /dev/tcp/localhost/9000"]
-      interval: 250ms
-      timeout: 1s
-      retries: 240
-      start_period: 250ms
+      - OTEL_SERVICE_NAME=base-prover-zk-host-${PROVER_SERVICE_NETWORK:-local}
     restart: unless-stopped

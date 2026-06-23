@@ -1,67 +1,156 @@
 set positional-arguments := true
 set working-directory := '../..'
 
-_script := "etc/scripts/zk-prover/grpc.sh"
 _ca_compose := "etc/scripts/zk-prover/ca-compose.sh"
 _ca_combined_file := "/tmp/zk-prover-ca-certificates.crt"
 _ca_extra_file := "/etc/ssl/certs/zk-prover-extra-ca.pem"
-_ca_service := "base-prover-zk"
-_ca_service_command := "./base-prover-zk"
+_ca_service := "base-prover-zk-host"
+_ca_service_command := "./base-prover-zk-host"
 _ca_system_file := "/etc/ssl/certs/ca-certificates.crt"
 _compose := "-f etc/docker/docker-compose.zk-prover.yml"
-_endpoint := "${ZK_PROVER_ENDPOINT:-localhost:${ZK_PROVER_GRPC_PORT:-9000}}"
+_endpoint := "${PROVER_SERVICE_ENDPOINT:-http://localhost:${PROVER_SERVICE_RPC_PORT:-9000}}"
 _project := "zk-prover"
 _yaml_to_env := "etc/scripts/yaml-to-compose-env.py"
 
-# Show ZK prover request commands
+# Show prover-service request commands
 default:
     @just --justfile {{ source_file() }} --list --list-prefix '  zk-prover::'
 
-# Start a standalone ZK prover for a network: just zk-prover up network=sepolia mode=dry-run|cluster
+# Start a standalone prover-service and ZK host for a network: just zk-prover up network=sepolia mode=dry-run|cluster
 up network='devnet' mode='dry-run':
     #!/usr/bin/env bash
     set -euo pipefail
     just --justfile {{ source_file() }} _up "{{ network }}" "{{ mode }}"
 
-# Stop the active standalone ZK prover
+# Stop the active standalone prover-service stack
 down:
     #!/usr/bin/env bash
     set -euo pipefail
     docker compose -p "{{ _project }}" {{ _compose }} down --remove-orphans
 
-# Stream active standalone ZK prover logs
+# Stream active standalone prover-service stack logs
 logs *containers:
     #!/usr/bin/env bash
     set -euo pipefail
-    docker compose -p "{{ _project }}" {{ _compose }} logs -f {{ if containers == "" { "base-prover-zk zk-prover-postgres" } else { containers } }}
+    docker compose -p "{{ _project }}" {{ _compose }} logs -f {{ if containers == "" { "base-prover-service base-prover-zk-host prover-service-postgres" } else { containers } }}
 
-# List services exposed by the active ZK prover endpoint
-list:
-    bash "{{ _script }}" list "{{ _endpoint }}"
-
-# Describe the ZK prover gRPC service
-describe:
-    bash "{{ _script }}" describe "{{ _endpoint }}"
-
-# Request a proof or dry-run for a block range: proof_type=compressed|snark
-prove start_block number_of_blocks='1' proof_type='compressed':
+# List JSON-RPC methods exposed by the active prover-service endpoint
+methods:
     #!/usr/bin/env bash
     set -euo pipefail
+    curl -fsS \
+      --header 'content-type: application/json' \
+      --data '{"jsonrpc":"2.0","method":"rpc_methods","params":[],"id":1}' \
+      "{{ _endpoint }}"
+    printf '\n'
+
+# Alias for listing JSON-RPC methods
+list:
+    @just --justfile {{ source_file() }} methods
+
+# Request a proof or dry-run for a block range: proof_type=compressed|snark
+prove start_block number_of_blocks='1' proof_type='compressed' session_id='' prover_address='' l1_head='':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    start_block="{{ start_block }}"
+    start_block="${start_block#start_block=}"
+    number_of_blocks="{{ number_of_blocks }}"
+    number_of_blocks="${number_of_blocks#number_of_blocks=}"
     proof_type="{{ proof_type }}"
     proof_type="${proof_type#proof_type=}"
-    bash "{{ _script }}" prove "{{ start_block }}" "{{ number_of_blocks }}" "{{ _endpoint }}" "$proof_type"
+    proof_type="$(printf '%s' "$proof_type" | tr '[:upper:]-' '[:lower:]_')"
+    session_id="{{ session_id }}"
+    session_id="${session_id#session_id=}"
+    prover_address="{{ prover_address }}"
+    prover_address="${prover_address#prover_address=}"
+    l1_head="{{ l1_head }}"
+    l1_head="${l1_head#l1_head=}"
 
-# Get proof status and, for dry-run mode, executionStats
-get session_id receipt_type='':
-    bash "{{ _script }}" get "{{ session_id }}" "{{ _endpoint }}" "{{ receipt_type }}"
+    if [ -z "$session_id" ]; then
+      session_id="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+    fi
+    if [ -z "$prover_address" ]; then
+      prover_address="0x0000000000000000000000000000000000000000"
+    fi
+    l1_head_field=""
+    if [ -n "$l1_head" ]; then
+      l1_head_field=",\"l1_head\":\"$l1_head\""
+    fi
 
-# Fetch and parse a proof receipt
-receipt session_id receipt_type='snark' export_json='':
-    bash "{{ _script }}" receipt "{{ session_id }}" "{{ _endpoint }}" "{{ receipt_type }}" "{{ export_json }}"
+    case "$proof_type" in
+      compressed)
+        printf -v payload \
+          '{"jsonrpc":"2.0","method":"prover_proveBlockRange","params":[{"proof":{"session_id":"%s","request":{"proof_type":"compressed","payload":{"start_block_number":%s,"number_of_blocks_to_prove":%s,"zk_vm":"sp1"%s}}}}],"id":1}' \
+          "$session_id" "$start_block" "$number_of_blocks" "$l1_head_field"
+        ;;
+      snark|groth16|snark_groth16)
+        printf -v payload \
+          '{"jsonrpc":"2.0","method":"prover_proveBlockRange","params":[{"proof":{"session_id":"%s","request":{"proof_type":"snark_groth16","payload":{"proof":{"start_block_number":%s,"number_of_blocks_to_prove":%s,"zk_vm":"sp1"%s},"prover_address":"%s"}}}}],"id":1}' \
+          "$session_id" "$start_block" "$number_of_blocks" "$l1_head_field" "$prover_address"
+        ;;
+      *)
+        echo "unknown proof_type: $proof_type (use compressed or snark)" >&2
+        exit 1
+        ;;
+    esac
+
+    curl -fsS --header 'content-type: application/json' --data "$payload" "{{ _endpoint }}"
+    printf '\n'
+
+# Get proof status and result
+get session_id:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    session_id="{{ session_id }}"
+    session_id="${session_id#session_id=}"
+    printf -v payload \
+      '{"jsonrpc":"2.0","method":"prover_getProof","params":[{"session_id":"%s"}],"id":1}' \
+      "$session_id"
+    curl -fsS --header 'content-type: application/json' --data "$payload" "{{ _endpoint }}"
+    printf '\n'
+
+# Delete a terminal proof request so the same session id can be retried
+delete session_id:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    session_id="{{ session_id }}"
+    session_id="${session_id#session_id=}"
+    printf -v payload \
+      '{"jsonrpc":"2.0","method":"prover_deleteProofRequest","params":[{"session_id":"%s"}],"id":1}' \
+      "$session_id"
+    curl -fsS --header 'content-type: application/json' --data "$payload" "{{ _endpoint }}"
+    printf '\n'
 
 # List recent proof requests
 list-proofs limit='20' offset='0' status_filter='':
-    bash "{{ _script }}" list-proofs "{{ _endpoint }}" "{{ limit }}" "{{ offset }}" "{{ status_filter }}"
+    #!/usr/bin/env bash
+    set -euo pipefail
+    limit="{{ limit }}"
+    limit="${limit#limit=}"
+    offset="{{ offset }}"
+    offset="${offset#offset=}"
+    status_filter="{{ status_filter }}"
+    status_filter="${status_filter#status_filter=}"
+    status_filter="$(printf '%s' "$status_filter" | tr '[:upper:]-' '[:lower:]_')"
+    if [ "$status_filter" = "pending" ]; then
+      status_filter="queued"
+    fi
+    case "$status_filter" in
+      ""|queued|running|succeeded|failed) ;;
+      *)
+        echo "unknown status_filter: $status_filter (use queued, running, succeeded, or failed)" >&2
+        exit 1
+        ;;
+    esac
+    status_field=""
+    if [ -n "$status_filter" ]; then
+      status_field=",\"status_filter\":\"$status_filter\""
+    fi
+    printf -v payload \
+      '{"jsonrpc":"2.0","method":"prover_listProofs","params":[{"limit":%s,"offset":%s%s}],"id":1}' \
+      "$limit" "$offset" "$status_field"
+    curl -fsS --header 'content-type: application/json' --data "$payload" "{{ _endpoint }}"
+    printf '\n'
 
 [private]
 _network-env network output:
@@ -85,7 +174,7 @@ _network-env network output:
       --map l1_beacon_rpc=L1_BEACON_ADDRESS \
       --map l1_beacon=L1_BEACON_ADDRESS \
       --map beacon_rpc=L1_BEACON_ADDRESS \
-      --default ZK_PROVER_NETWORK="$network" \
+      --default PROVER_SERVICE_NETWORK="$network" \
       --require L2_NODE_ADDRESS \
       --require L1_NODE_ADDRESS \
       --require BASE_CONSENSUS_ADDRESS \
@@ -104,7 +193,7 @@ _cluster-env network output:
       exit 1
     fi
     python3 "{{ _yaml_to_env }}" "$config" "{{ output }}" \
-      --map sp1.prover=SP1_PROVER \
+      --map sp1.prover=ZK_BACKEND \
       --map sp1.cluster_api_endpoint=SP1_CLUSTER_API_ENDPOINT \
       --map sp1.cluster_timeout_hours=SP1_CLUSTER_TIMEOUT_HOURS \
       --map artifact.s3_bucket=CLI_S3_BUCKET \
@@ -116,7 +205,7 @@ _cluster-env network output:
       --map sp1.ca_cert_file=ZK_PROVER_CA_CERT_FILE \
       --map sp1.cluster_ca_cert_file=ZK_PROVER_CA_CERT_FILE \
       --map logging.rust_log=RUST_LOG \
-      --default SP1_PROVER=cluster \
+      --default ZK_BACKEND=cluster \
       --default SP1_CLUSTER_TIMEOUT_HOURS=24 \
       --default CLI_S3_REGION=us-east-1 \
       --default AWS_DEFAULT_REGION=us-east-1 \
@@ -135,7 +224,7 @@ _build profile='release':
       arm64|aarch64) platform_pair="linux-arm64" ;;
       *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
     esac
-    ZK_PROVER_PROFILE="{{ profile }}" PLATFORM_PAIR="${platform_pair}" docker buildx bake -f etc/docker/docker-bake.hcl zk-prover --load
+    ZK_PROVER_PROFILE="{{ profile }}" PLATFORM_PAIR="${platform_pair}" docker buildx bake -f etc/docker/docker-bake.hcl prover-service zk-host --load
 
 [private]
 _up network mode:
@@ -164,7 +253,7 @@ _up network mode:
       dry-run)
         just --justfile {{ source_file() }} _build "release"
         docker compose -p "{{ _project }}" --env-file "$network_env" {{ _compose }} down --remove-orphans
-        SP1_PROVER=dry-run docker compose -p "{{ _project }}" --env-file "$network_env" {{ _compose }} up -d --no-build
+        ZK_BACKEND=dry_run docker compose -p "{{ _project }}" --env-file "$network_env" {{ _compose }} up -d --no-build
         ;;
       cluster)
         if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
@@ -201,5 +290,5 @@ _up network mode:
         exit 1
         ;;
     esac
-    printf 'ZK prover active network: %s\n' "$network"
-    printf 'ZK prover endpoint: %s\n' "{{ _endpoint }}"
+    printf 'Prover-service active network: %s\n' "$network"
+    printf 'Prover-service endpoint: %s\n' "{{ _endpoint }}"
