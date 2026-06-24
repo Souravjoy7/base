@@ -234,9 +234,9 @@ impl ProposerService {
         };
         let proof_dispatcher = ProofDispatcher::new(
             Arc::clone(&proof_requester),
-            Arc::clone(&l1_client),
-            Arc::clone(&l2_client),
-            Arc::clone(&rollup_client),
+            l1_client.clone(),
+            l2_client.clone(),
+            rollup_client.clone(),
             ProofDispatcherConfig {
                 proposer_address: driver_config.proposer_address,
                 intermediate_block_interval: driver_config.intermediate_block_interval,
