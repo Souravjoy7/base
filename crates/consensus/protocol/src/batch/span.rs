@@ -445,7 +445,12 @@ impl SpanBatch {
 
             // Check if we ran out of sequencer time drift
             let max_drift = cfg.max_sequencer_drift(l1_origin.timestamp);
-            if batch_timestamp > l1_origin.timestamp + max_drift {
+            let max = if let Some(max) = l1_origin.timestamp.checked_add(max_drift) {
+                max
+            } else {
+                return BatchValidity::Drop(BatchDropReason::SequencerDriftOverflow);
+            };
+            if batch_timestamp > max {
                 if batch.transactions.is_empty() {
                     // If the sequencer is co-operating by producing an empty batch,
                     // then allow the batch if it was the right thing to do to maintain the L2 time
@@ -482,7 +487,7 @@ impl SpanBatch {
                     warn!(
                         target: "batch_span",
                         "batch exceeded sequencer time drift, sequencer must adopt new L1 origin to include transactions again, max_time: {}",
-                        l1_origin.timestamp + max_drift
+                        max
                     );
                     return BatchValidity::Drop(BatchDropReason::SequencerDriftExceeded);
                 }
