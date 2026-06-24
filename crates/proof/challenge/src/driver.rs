@@ -24,8 +24,11 @@ use alloy_primitives::{Address, B256};
 use base_proof_contracts::{AggregateVerifierClient, GameStatus};
 use base_proof_primitives::ProofRequest as TeeProofRequest;
 use base_proof_rpc::L2Provider;
+use base_proof_zk_requester::{
+    Groth16ProofRequestResponse, Groth16RangeProofRequest, ZkProofRequester, ZkProofRequesterError,
+};
 use base_prover_service_client::ProofRequesterProvider;
-use base_prover_service_protocol::{SnarkGroth16ProofRequest, TeeKind, ZkProofRequest, ZkVm};
+use base_prover_service_protocol::{DeleteProofRequest, TeeKind, ZkProofRequest, ZkVm};
 use base_runtime::{Clock, TokioRuntime};
 use base_tx_manager::TxManager;
 use tokio::select;
@@ -610,16 +613,20 @@ impl<L2: L2Provider, P: ProofRequesterProvider, T: TxManager, C: Clock> Driver<L
         })
     }
 
-    /// Builds a [`SnarkGroth16ProofRequest`] for the given candidate and invalid index.
+    /// Builds a [`Groth16RangeProofRequest`] for the given candidate and invalid index.
     fn build_zk_request(
         &self,
         candidate: &CandidateGame,
         invalid_index: u64,
-    ) -> eyre::Result<SnarkGroth16ProofRequest> {
+    ) -> eyre::Result<Groth16RangeProofRequest> {
         let start_block_number = candidate.checkpoint_start_block(invalid_index)?;
 
-        Ok(SnarkGroth16ProofRequest {
-            proof: ZkProofRequest {
+        Ok(Groth16RangeProofRequest::new(
+            crate::ChallengerProofAdapter::snark_groth16_session_id(
+                candidate.factory.proxy,
+                invalid_index,
+            ),
+            ZkProofRequest {
                 start_block_number,
                 number_of_blocks_to_prove: candidate.intermediate_block_interval,
                 sequence_window: None,
@@ -627,8 +634,8 @@ impl<L2: L2Provider, P: ProofRequesterProvider, T: TxManager, C: Clock> Driver<L
                 intermediate_root_interval: Some(candidate.intermediate_block_interval),
                 zk_vm: ZkVm::Sp1,
             },
-            prover_address: self.submitter.sender_address(),
-        })
+            self.submitter.sender_address(),
+        ))
     }
 
     /// Requests a ZK proof, stores the session, and polls for the result.
@@ -646,22 +653,18 @@ impl<L2: L2Provider, P: ProofRequesterProvider, T: TxManager, C: Clock> Driver<L
         // needs to cover the single interval that contains the invalid
         // checkpoint: [prior_checkpoint .. invalid_checkpoint].
         let proof_request = self.build_zk_request(&candidate, invalid_index)?;
-        let request = crate::ChallengerProofAdapter::snark_groth16_prove_block_range_request(
-            game_address,
-            invalid_index,
-            proof_request.clone(),
-        );
 
-        let prove_response = self.proof_requester.prove_block_range(request).await?;
+        let prove_response = self.request_groth16_proof(game_address, &proof_request).await?;
 
         info!(
             game = %game_address,
-            session_id = %prove_response.session_id,
+            range_session_id = %prove_response.range.session_id,
+            aggregation_session_id = %prove_response.aggregation.session_id,
             "proof job initiated"
         );
 
         let pending = PendingProof::awaiting(
-            prove_response.session_id,
+            prove_response.aggregation.session_id,
             invalid_index,
             expected_root,
             proof_request,
@@ -840,8 +843,6 @@ impl<L2: L2Provider, P: ProofRequesterProvider, T: TxManager, C: Clock> Driver<L
         };
 
         let retry_count = pending.retry_count;
-        let invalid_index = pending.invalid_index;
-
         if retry_count > Self::MAX_PROOF_RETRIES {
             warn!(
                 game = %game_address,
@@ -887,23 +888,18 @@ impl<L2: L2Provider, P: ProofRequesterProvider, T: TxManager, C: Clock> Driver<L
 
         ChallengerMetrics::proof_retries_total().increment(1);
 
-        let prove_request = crate::ChallengerProofAdapter::snark_groth16_prove_block_range_request(
-            game_address,
-            invalid_index,
-            request,
-        );
-
-        match self.proof_requester.prove_block_range(prove_request).await {
+        match self.request_groth16_proof(game_address, &request).await {
             Ok(response) => {
                 info!(
                     game = %game_address,
-                    session_id = %response.session_id,
+                    range_session_id = %response.range.session_id,
+                    aggregation_session_id = %response.aggregation.session_id,
                     retry_count = retry_count,
                     "proof job re-initiated"
                 );
                 if let Some(p) = self.pending_proofs.get_mut(&game_address) {
                     p.phase = ProofPhase::AwaitingProof {
-                        session_id: response.session_id,
+                        session_id: response.aggregation.session_id,
                         started_at: Instant::now(),
                     };
                 }
@@ -923,5 +919,44 @@ impl<L2: L2Provider, P: ProofRequesterProvider, T: TxManager, C: Clock> Driver<L
         }
 
         Ok(())
+    }
+
+    async fn request_groth16_proof(
+        &self,
+        game_address: Address,
+        request: &Groth16RangeProofRequest,
+    ) -> Result<Groth16ProofRequestResponse, ZkProofRequesterError> {
+        match ZkProofRequester::new(&*self.proof_requester).request_groth16_proof(request).await {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                if let ZkProofRequesterError::AggregationRequestFailed {
+                    range_session_id, ..
+                } = &error
+                {
+                    warn!(
+                        game = %game_address,
+                        range_session_id = %range_session_id,
+                        error = %error,
+                        "aggregation request failed after range request was accepted"
+                    );
+                    if let Err(delete_error) = self
+                        .proof_requester
+                        .delete_proof_request(DeleteProofRequest {
+                            session_id: range_session_id.clone(),
+                        })
+                        .await
+                    {
+                        warn!(
+                            game = %game_address,
+                            range_session_id = %range_session_id,
+                            error = %delete_error,
+                            "accepted range proof cleanup failed"
+                        );
+                    }
+                }
+
+                Err(error)
+            }
+        }
     }
 }

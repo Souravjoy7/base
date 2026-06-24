@@ -711,6 +711,10 @@ pub struct MockZkProofState {
     pub error_message: Option<String>,
     /// Every [`ProveBlockRangeRequest`] received by `prove_block_range`, in call order.
     pub prove_block_range_log: Vec<ProveBlockRangeRequest>,
+    /// One-indexed proveBlockRange call number that should fail.
+    pub fail_prove_block_range_call: Option<usize>,
+    /// Every [`DeleteProofRequest`] received by `delete_proof_request`, in call order.
+    pub delete_proof_request_log: Vec<DeleteProofRequest>,
 }
 
 impl Default for MockZkProofState {
@@ -722,7 +726,25 @@ impl Default for MockZkProofState {
             omit_result_on_success: false,
             error_message: None,
             prove_block_range_log: Vec::new(),
+            fail_prove_block_range_call: None,
+            delete_proof_request_log: Vec::new(),
         }
+    }
+}
+
+impl MockZkProofState {
+    /// Returns a default ZK result for the requested session.
+    pub fn default_zk_result(&self, session_id: &str) -> ApiProofResult {
+        if session_id.ends_with(":range") {
+            return ApiProofResult::Compressed(ZkProofResult {
+                zk_vm: ZkVm::Sp1,
+                proof: self.proof.clone().into(),
+            });
+        }
+
+        ApiProofResult::SnarkGroth16(SnarkGroth16ProofResult {
+            proof: ZkProofResult { zk_vm: ZkVm::Sp1, proof: self.proof.clone().into() },
+        })
     }
 }
 
@@ -739,24 +761,25 @@ impl ProofRequesterProvider for MockZkProofProvider {
         request: ProveBlockRangeRequest,
     ) -> Result<ProveBlockRangeResponse, ProverServiceClientError> {
         let session_id = request.proof.session_id.clone();
-        self.state.lock().unwrap().prove_block_range_log.push(request);
+        let mut state = self.state.lock().unwrap();
+        state.prove_block_range_log.push(request);
+        if state.fail_prove_block_range_call == Some(state.prove_block_range_log.len()) {
+            return Err(ProverServiceClientError::Timeout("proveBlockRange failed".to_owned()));
+        }
         Ok(ProveBlockRangeResponse { session_id })
     }
 
     async fn get_proof(
         &self,
-        _request: GetProofRequest,
+        request: GetProofRequest,
     ) -> Result<GetProofResponse, ProverServiceClientError> {
         let state = self.state.lock().unwrap().clone();
         let result = if state.proof_status == ProofStatus::Succeeded {
             if state.omit_result_on_success {
                 None
             } else {
-                state.result.or_else(|| {
-                    Some(ApiProofResult::SnarkGroth16(SnarkGroth16ProofResult {
-                        proof: ZkProofResult { zk_vm: ZkVm::Sp1, proof: state.proof.into() },
-                    }))
-                })
+                let default_result = state.default_zk_result(&request.session_id);
+                state.result.or(Some(default_result))
             }
         } else {
             None
@@ -773,6 +796,7 @@ impl ProofRequesterProvider for MockZkProofProvider {
         request: DeleteProofRequest,
     ) -> Result<(), ProverServiceClientError> {
         let mut state = self.state.lock().unwrap();
+        state.delete_proof_request_log.push(request.clone());
         state.prove_block_range_log.retain(|entry| entry.proof.session_id != request.session_id);
         Ok(())
     }

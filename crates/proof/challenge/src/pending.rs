@@ -13,8 +13,9 @@ use std::{
 };
 
 use alloy_primitives::{Address, B256, Bytes};
+use base_proof_zk_requester::{Groth16ProofStatus, Groth16RangeProofRequest, ZkProofRequester};
 use base_prover_service_client::ProofRequesterProvider;
-use base_prover_service_protocol::{GetProofRequest, ProofStatus, SnarkGroth16ProofRequest};
+use base_prover_service_protocol::{GetProofRequest, ProofResult, ProofStatus};
 use tracing::warn;
 
 use crate::{ChallengerMetrics, ChallengerProofAdapter};
@@ -32,7 +33,7 @@ pub enum ProofKind {
     Tee {
         /// Pre-built ZK request for fallback if TEE submission fails.
         /// `None` when the fallback request could not be constructed.
-        zk_fallback_request: Option<SnarkGroth16ProofRequest>,
+        zk_fallback_request: Option<Groth16RangeProofRequest>,
         /// The dispute intent to use for the ZK fallback path.
         /// `None` when the fallback request could not be constructed.
         zk_fallback_intent: Option<DisputeIntent>,
@@ -43,7 +44,7 @@ pub enum ProofKind {
     /// `proveBlockRange` on failure.
     Zk {
         /// Original request parameters for retry.
-        prove_request: SnarkGroth16ProofRequest,
+        prove_request: Groth16RangeProofRequest,
     },
 }
 
@@ -112,7 +113,7 @@ impl PendingProof {
         session_id: String,
         invalid_index: u64,
         expected_root: B256,
-        prove_request: SnarkGroth16ProofRequest,
+        prove_request: Groth16RangeProofRequest,
         intent: DisputeIntent,
     ) -> Self {
         Self {
@@ -130,7 +131,7 @@ impl PendingProof {
         session_id: String,
         invalid_index: u64,
         expected_root: B256,
-        zk_fallback_request: Option<SnarkGroth16ProofRequest>,
+        zk_fallback_request: Option<Groth16RangeProofRequest>,
         zk_fallback_intent: Option<DisputeIntent>,
     ) -> Self {
         Self {
@@ -148,7 +149,7 @@ impl PendingProof {
         proof_bytes: Bytes,
         invalid_index: u64,
         expected_root: B256,
-        prove_request: SnarkGroth16ProofRequest,
+        prove_request: Groth16RangeProofRequest,
         intent: DisputeIntent,
     ) -> Self {
         Self {
@@ -237,10 +238,8 @@ impl PendingProofs {
             None => return Ok(None),
         };
 
-        let (session_id, started_at) = match &pending.phase {
-            ProofPhase::AwaitingProof { session_id, started_at } => {
-                (session_id.clone(), *started_at)
-            }
+        let started_at = match &pending.phase {
+            ProofPhase::AwaitingProof { started_at, .. } => *started_at,
             ProofPhase::ReadyToSubmit { proof_bytes } => {
                 return Ok(Some(ProofUpdate::Ready(proof_bytes.clone())));
             }
@@ -269,6 +268,69 @@ impl PendingProofs {
             return Ok(Some(ProofUpdate::NeedsRetry));
         }
 
+        let zk_prove_request = match &pending.kind {
+            ProofKind::Zk { prove_request } => Some(prove_request.clone()),
+            ProofKind::Tee { .. } => None,
+        };
+
+        if let Some(prove_request) = zk_prove_request {
+            let status =
+                ZkProofRequester::new(proof_requester).groth16_status(&prove_request).await?;
+
+            let pending = match self.0.get_mut(&game) {
+                Some(p) => p,
+                None => return Ok(None),
+            };
+
+            let update = match status {
+                Groth16ProofStatus::Succeeded(result) => {
+                    let proof_bytes = ChallengerProofAdapter::snark_groth16_dispute_proof_bytes(
+                        ProofResult::SnarkGroth16(result),
+                    )?;
+                    pending.phase = ProofPhase::ReadyToSubmit { proof_bytes: proof_bytes.clone() };
+                    ProofUpdate::Ready(proof_bytes)
+                }
+                Groth16ProofStatus::Pending => ProofUpdate::Pending,
+                Groth16ProofStatus::Failed { session_id, message } => {
+                    warn!(
+                        game = %game,
+                        session_id = %session_id,
+                        error_message = %message,
+                        "proof job failed"
+                    );
+                    ChallengerMetrics::proof_session_failures_total(
+                        ChallengerMetrics::PROOF_FAILURE_FAILED,
+                    )
+                    .increment(1);
+                    pending.retry_count += 1;
+                    pending.phase = ProofPhase::NeedsRetry;
+                    ProofUpdate::NeedsRetry
+                }
+                Groth16ProofStatus::Malformed { session_id } => {
+                    warn!(
+                        game = %game,
+                        session_id = %session_id,
+                        "proof response malformed, treating as retryable failure"
+                    );
+                    ChallengerMetrics::proof_session_failures_total(
+                        ChallengerMetrics::PROOF_FAILURE_MALFORMED,
+                    )
+                    .increment(1);
+                    pending.retry_count += 1;
+                    pending.phase = ProofPhase::NeedsRetry;
+                    ProofUpdate::NeedsRetry
+                }
+            };
+
+            return Ok(Some(update));
+        }
+
+        let session_id = match &pending.phase {
+            ProofPhase::AwaitingProof { session_id, .. } => session_id.clone(),
+            ProofPhase::ReadyToSubmit { .. } | ProofPhase::NeedsRetry => {
+                unreachable!("ready and retry phases returned above")
+            }
+        };
         let request = GetProofRequest { session_id };
 
         let response = proof_requester.get_proof(request).await?;
@@ -291,31 +353,24 @@ impl PendingProofs {
                     pending.phase = ProofPhase::NeedsRetry;
                     return Ok(Some(ProofUpdate::NeedsRetry));
                 };
-                let proof_bytes = match &pending.kind {
-                    ProofKind::Zk { .. } => {
-                        ChallengerProofAdapter::snark_groth16_dispute_proof_bytes(result)?
-                    }
-                    ProofKind::Tee { .. } => {
-                        match ChallengerProofAdapter::tee_dispute_proof_bytes(
-                            result,
-                            pending.expected_root,
-                        ) {
-                            Ok(proof_bytes) => proof_bytes,
-                            Err(e) => {
-                                warn!(
-                                    game = %game,
-                                    error = %e,
-                                    "TEE proof validation failed, falling back to ZK"
-                                );
-                                ChallengerMetrics::proof_session_failures_total(
-                                    ChallengerMetrics::PROOF_FAILURE_TEE_VALIDATION,
-                                )
-                                .increment(1);
-                                pending.retry_count += 1;
-                                pending.phase = ProofPhase::NeedsRetry;
-                                return Ok(Some(ProofUpdate::NeedsRetry));
-                            }
-                        }
+                let proof_bytes = match ChallengerProofAdapter::tee_dispute_proof_bytes(
+                    result,
+                    pending.expected_root,
+                ) {
+                    Ok(proof_bytes) => proof_bytes,
+                    Err(e) => {
+                        warn!(
+                            game = %game,
+                            error = %e,
+                            "TEE proof validation failed, falling back to ZK"
+                        );
+                        ChallengerMetrics::proof_session_failures_total(
+                            ChallengerMetrics::PROOF_FAILURE_TEE_VALIDATION,
+                        )
+                        .increment(1);
+                        pending.retry_count += 1;
+                        pending.phase = ProofPhase::NeedsRetry;
+                        return Ok(Some(ProofUpdate::NeedsRetry));
                     }
                 };
                 let update = ProofUpdate::Ready(proof_bytes.clone());

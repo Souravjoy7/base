@@ -17,6 +17,27 @@ pub struct Groth16ProofRequestResponse {
     pub aggregation: ProveBlockRangeResponse,
 }
 
+/// Status returned while polling a requested Groth16 proof flow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Groth16ProofStatus {
+    /// The range or aggregation stage is still in progress.
+    Pending,
+    /// The aggregation stage completed with a Groth16 proof.
+    Succeeded(SnarkGroth16ProofResult),
+    /// One of the proof stages failed terminally.
+    Failed {
+        /// Prover-service session identifier for the failed stage.
+        session_id: String,
+        /// Failure message returned by prover-service.
+        message: String,
+    },
+    /// A proof stage returned a success response that could not be used.
+    Malformed {
+        /// Prover-service session identifier for the malformed stage.
+        session_id: String,
+    },
+}
+
 /// Higher-level requester for ZK proof flows backed by prover-service requests.
 #[derive(Debug, Clone)]
 pub struct ZkProofRequester<Client> {
@@ -90,6 +111,28 @@ where
                 Err(Self::unexpected_result(session_id, &result, ProofType::SnarkGroth16))
             }
             None => Ok(None),
+        }
+    }
+
+    /// Return normalized status for a requested Groth16 proof flow.
+    ///
+    /// This stateless poll rechecks the range stage before checking the
+    /// aggregation stage. Callers should stop polling after [`Groth16ProofStatus::Succeeded`].
+    pub async fn groth16_status(
+        &self,
+        request: &Groth16RangeProofRequest,
+    ) -> Result<Groth16ProofStatus, ZkProofRequesterError> {
+        match self.groth16_result(request).await {
+            Ok(Some(result)) => Ok(Groth16ProofStatus::Succeeded(result)),
+            Ok(None) => Ok(Groth16ProofStatus::Pending),
+            Err(ZkProofRequesterError::ProofFailed { session_id, message }) => {
+                Ok(Groth16ProofStatus::Failed { session_id, message })
+            }
+            Err(
+                ZkProofRequesterError::MissingResult { session_id }
+                | ZkProofRequesterError::UnexpectedResult { session_id, .. },
+            ) => Ok(Groth16ProofStatus::Malformed { session_id }),
+            Err(error) => Err(error),
         }
     }
 
@@ -277,6 +320,55 @@ mod tests {
         );
 
         assert_eq!(requester.client().submitted(), vec!["parent:range", "parent:aggregation"]);
+    }
+
+    #[tokio::test]
+    async fn groth16_status_returns_succeeded_after_range_and_aggregation_succeed() {
+        let requester = MockProofRequester::with_responses(VecDeque::from([
+            succeeded(compressed_result()),
+            succeeded(snark_result()),
+        ]));
+        let requester = ZkProofRequester::new(requester);
+        let request =
+            Groth16RangeProofRequest::new("parent", proof_request(), Address::repeat_byte(0x11));
+
+        let status = requester.groth16_status(&request).await.unwrap();
+
+        let Groth16ProofStatus::Succeeded(result) = status else {
+            panic!("expected succeeded status");
+        };
+        assert_eq!(result.proof.proof, Bytes::from(vec![2]));
+    }
+
+    #[tokio::test]
+    async fn groth16_status_normalizes_failed_and_malformed_stages() {
+        let requester = MockProofRequester::with_responses(VecDeque::from([GetProofResponse {
+            status: ProofStatus::Failed,
+            error_message: Some("range failed".to_owned()),
+            result: None,
+        }]));
+        let requester = ZkProofRequester::new(requester);
+        let request =
+            Groth16RangeProofRequest::new("parent", proof_request(), Address::repeat_byte(0x11));
+
+        assert_eq!(
+            requester.groth16_status(&request).await.unwrap(),
+            Groth16ProofStatus::Failed {
+                session_id: "parent:range".to_owned(),
+                message: "range failed".to_owned(),
+            }
+        );
+
+        let requester = MockProofRequester::with_responses(VecDeque::from([
+            succeeded(compressed_result()),
+            GetProofResponse { status: ProofStatus::Succeeded, error_message: None, result: None },
+        ]));
+        let requester = ZkProofRequester::new(requester);
+
+        assert_eq!(
+            requester.groth16_status(&request).await.unwrap(),
+            Groth16ProofStatus::Malformed { session_id: "parent:aggregation".to_owned() }
+        );
     }
 
     #[tokio::test]

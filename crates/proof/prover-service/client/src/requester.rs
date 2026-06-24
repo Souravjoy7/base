@@ -227,6 +227,40 @@ impl ProofRequesterProvider for ProofRequesterClient {
     }
 }
 
+#[async_trait]
+impl<Client> ProofRequesterProvider for &Client
+where
+    Client: ProofRequesterProvider + ?Sized,
+{
+    async fn prove_block_range(
+        &self,
+        request: ProveBlockRangeRequest,
+    ) -> Result<ProveBlockRangeResponse, ProverServiceClientError> {
+        (**self).prove_block_range(request).await
+    }
+
+    async fn get_proof(
+        &self,
+        request: GetProofRequest,
+    ) -> Result<GetProofResponse, ProverServiceClientError> {
+        (**self).get_proof(request).await
+    }
+
+    async fn delete_proof_request(
+        &self,
+        request: DeleteProofRequest,
+    ) -> Result<(), ProverServiceClientError> {
+        (**self).delete_proof_request(request).await
+    }
+
+    async fn list_proofs(
+        &self,
+        request: ListProofsRequest,
+    ) -> Result<ListProofsResponse, ProverServiceClientError> {
+        (**self).list_proofs(request).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{

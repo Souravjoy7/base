@@ -21,10 +21,10 @@ use base_challenger::{
 };
 use base_proof_contracts::{AggregateVerifierClient, ContractError, GameAtIndex, GameStatus};
 use base_proof_primitives::Proposal;
+use base_proof_zk_requester::Groth16RangeProofRequest;
 use base_protocol::OutputRoot;
 use base_prover_service_protocol::{
-    ProofResult as ApiProofResult, ProofStatus, SnarkGroth16ProofRequest, TeeKind, TeeProofResult,
-    ZkProofRequest, ZkVm,
+    ProofResult as ApiProofResult, ProofStatus, TeeKind, TeeProofResult, ZkProofRequest, ZkVm,
 };
 use base_runtime::TokioRuntime;
 use base_tx_manager::TxManagerError;
@@ -137,8 +137,9 @@ const fn tee_api_result(aggregate_proposal: Proposal) -> ApiProofResult {
 }
 
 fn default_ready_proof(intent: DisputeIntent) -> PendingProof {
-    let request = SnarkGroth16ProofRequest {
-        proof: ZkProofRequest {
+    let request = Groth16RangeProofRequest::new(
+        "ready-proof",
+        ZkProofRequest {
             start_block_number: 15,
             number_of_blocks_to_prove: 5,
             sequence_window: None,
@@ -146,8 +147,8 @@ fn default_ready_proof(intent: DisputeIntent) -> PendingProof {
             intermediate_root_interval: None,
             zk_vm: ZkVm::Sp1,
         },
-        prover_address: addr(0),
-    };
+        addr(0),
+    );
 
     PendingProof::ready(
         Bytes::from_static(&[0x01, 0xDE, 0xAD]),
@@ -599,12 +600,12 @@ async fn test_step_proof_retry_succeeds() {
 }
 
 // Regression test for CHAIN-4297 / Immunefi #75829: after a FAILED proof, the
-// driver must re-invoke `proveBlockRange` with the same deterministic
-// `session_id` so the service-side fix in `create_with_outbox` can requeue
-// the row. Independent of the DB layer; fails on a challenger-side regression
-// such as dropping the retry call or losing proof-session determinism.
+// driver must re-invoke `proveBlockRange` with the same deterministic child
+// `session_id`s so the service-side fix in `create_with_outbox` can requeue
+// the rows. Independent of the DB layer; fails on a challenger-side regression
+// such as dropping the retry calls or losing proof-session determinism.
 #[tokio::test]
-async fn test_step_proof_retry_reuses_deterministic_session_id() {
+async fn test_step_proof_retry_reuses_deterministic_groth16_session_ids() {
     let (l2, factory, verifier) = invalid_game_mocks();
 
     let zk = Arc::new(MockZkProofProvider {
@@ -620,41 +621,58 @@ async fn test_step_proof_retry_reuses_deterministic_session_id() {
     let mut driver = test_driver(factory, Arc::clone(&verifier), l2, Arc::clone(&zk), tx_manager);
 
     let expected_session_id = ChallengerProofAdapter::snark_groth16_session_id(addr(0), 1);
+    let expected_range_session_id = format!("{expected_session_id}:range");
+    let expected_aggregation_session_id = format!("{expected_session_id}:aggregation");
 
-    // Step 1: initial proveBlockRange call from initiate_zk_proof.
+    // Step 1: initial range and aggregation proveBlockRange calls from initiate_zk_proof.
     driver.step().await.unwrap();
     {
         let log = &zk.state.lock().unwrap().prove_block_range_log;
-        assert_eq!(log.len(), 1, "exactly one prove_block_range call on initiation");
+        assert_eq!(log.len(), 2, "range and aggregation prove_block_range calls on initiation");
         assert_eq!(
             log[0].proof.session_id.as_str(),
-            expected_session_id.as_str(),
-            "challenger must use game-address/invalid-index session_id on initiation",
+            expected_range_session_id.as_str(),
+            "challenger must use deterministic range session_id on initiation",
+        );
+        assert_eq!(
+            log[1].proof.session_id.as_str(),
+            expected_aggregation_session_id.as_str(),
+            "challenger must use deterministic aggregation session_id on initiation",
         );
     }
 
     // Step 2: poll observes Failed → NeedsRetry → handle_proof_retry must
-    // invoke proveBlockRange again, reusing the same deterministic session_id.
+    // invoke proveBlockRange again, reusing the same deterministic child session IDs.
     driver.step().await.unwrap();
     {
         let log = &zk.state.lock().unwrap().prove_block_range_log;
-        assert_eq!(log.len(), 2, "retry must invoke prove_block_range a second time");
+        assert_eq!(log.len(), 4, "retry must invoke range and aggregation prove_block_range");
         assert_eq!(
-            log[1].proof.session_id.as_str(),
-            expected_session_id.as_str(),
-            "retry must reuse the deterministic session_id so the service can requeue",
+            log[2].proof.session_id.as_str(),
+            expected_range_session_id.as_str(),
+            "retry must reuse the deterministic range session_id so the service can requeue",
+        );
+        assert_eq!(
+            log[3].proof.session_id.as_str(),
+            expected_aggregation_session_id.as_str(),
+            "retry must reuse the deterministic aggregation session_id so the service can requeue",
         );
         assert_eq!(
             log[0].proof.session_id.as_str(),
+            log[2].proof.session_id.as_str(),
+            "the deterministic range session_id must be stable across retries",
+        );
+        assert_eq!(
             log[1].proof.session_id.as_str(),
-            "the deterministic session_id must be stable across retries",
+            log[3].proof.session_id.as_str(),
+            "the deterministic aggregation session_id must be stable across retries",
         );
     }
 
     let entry = driver.pending_proofs.get(&addr(0)).expect("entry should be retained after retry");
     assert!(
-        matches!(entry.phase, ProofPhase::AwaitingProof { ref session_id, .. } if session_id == &expected_session_id),
-        "post-retry phase must be AwaitingProof with the deterministic session_id",
+        matches!(entry.phase, ProofPhase::AwaitingProof { ref session_id, .. } if session_id == &expected_aggregation_session_id),
+        "post-retry phase must be AwaitingProof with the deterministic aggregation session_id",
     );
     assert_eq!(entry.retry_count, 1);
 
@@ -676,6 +694,71 @@ async fn test_step_proof_retry_reuses_deterministic_session_id() {
         !driver.pending_proofs.contains_key(&addr(0)),
         "entry should be removed after successful retry submission",
     );
+}
+
+#[tokio::test]
+async fn test_step_deletes_range_session_when_groth16_aggregation_request_fails() {
+    let (l2, factory, verifier) = invalid_game_mocks();
+
+    let zk = Arc::new(MockZkProofProvider {
+        session_id: String::new(),
+        state: Mutex::new(MockZkProofState {
+            fail_prove_block_range_call: Some(2),
+            ..Default::default()
+        }),
+    });
+
+    let tx_manager = default_tx_manager();
+    let mut driver = test_driver(factory, Arc::clone(&verifier), l2, Arc::clone(&zk), tx_manager);
+
+    let expected_session_id = ChallengerProofAdapter::snark_groth16_session_id(addr(0), 1);
+    let expected_range_session_id = format!("{expected_session_id}:range");
+
+    driver.step().await.unwrap();
+
+    let state = zk.state.lock().unwrap();
+    assert_eq!(
+        state.delete_proof_request_log.len(),
+        1,
+        "accepted range session should be deleted when aggregation submission fails"
+    );
+    assert_eq!(state.delete_proof_request_log[0].session_id, expected_range_session_id);
+    assert!(
+        !driver.pending_proofs.contains_key(&addr(0)),
+        "proof should not be tracked when initial aggregation request fails"
+    );
+}
+
+#[tokio::test]
+async fn test_step_deletes_range_session_when_retry_aggregation_request_fails() {
+    let (l2, factory, verifier) = invalid_game_mocks();
+
+    let zk = Arc::new(MockZkProofProvider {
+        session_id: String::new(),
+        state: Mutex::new(MockZkProofState {
+            proof_status: ProofStatus::Failed,
+            error_message: Some("transient backend error".into()),
+            fail_prove_block_range_call: Some(4),
+            ..Default::default()
+        }),
+    });
+
+    let tx_manager = default_tx_manager();
+    let mut driver = test_driver(factory, Arc::clone(&verifier), l2, Arc::clone(&zk), tx_manager);
+
+    let expected_session_id = ChallengerProofAdapter::snark_groth16_session_id(addr(0), 1);
+    let expected_range_session_id = format!("{expected_session_id}:range");
+
+    driver.step().await.unwrap();
+    driver.step().await.unwrap();
+
+    let state = zk.state.lock().unwrap();
+    assert_eq!(
+        state.delete_proof_request_log.len(),
+        1,
+        "accepted retry range session should be deleted when aggregation submission fails"
+    );
+    assert_eq!(state.delete_proof_request_log[0].session_id, expected_range_session_id);
 }
 
 #[tokio::test]
@@ -1697,9 +1780,10 @@ async fn test_step_checkpoint_count_mismatch_surfaces_error() {
     );
 }
 
-const fn minimal_prove_request() -> SnarkGroth16ProofRequest {
-    SnarkGroth16ProofRequest {
-        proof: ZkProofRequest {
+fn minimal_prove_request() -> Groth16RangeProofRequest {
+    Groth16RangeProofRequest::new(
+        "minimal-proof",
+        ZkProofRequest {
             start_block_number: 0,
             number_of_blocks_to_prove: 1,
             sequence_window: None,
@@ -1707,8 +1791,8 @@ const fn minimal_prove_request() -> SnarkGroth16ProofRequest {
             intermediate_root_interval: None,
             zk_vm: ZkVm::Sp1,
         },
-        prover_address: Address::ZERO,
-    }
+        Address::ZERO,
+    )
 }
 
 #[tokio::test]
