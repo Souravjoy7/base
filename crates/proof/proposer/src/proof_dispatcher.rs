@@ -7,7 +7,6 @@ use alloy_primitives::{Address, B256};
 use base_proof_primitives::ProofRequest;
 use base_proof_rpc::{L1Provider, L2Provider, RollupProvider};
 use base_prover_service_client::ProofRequesterProvider;
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -60,17 +59,12 @@ impl ProofDispatcher {
         recovered: RecoveredState,
         safe_head: u64,
         block_interval: u64,
-        cancel: &CancellationToken,
     ) {
         let mut current = cursor
             .filter(|(source, _)| *source == recovered)
             .map_or(recovered, |(_, cursor)| cursor);
 
         loop {
-            if cancel.is_cancelled() {
-                break;
-            }
-
             let Some(target_block) =
                 ProofTarget::next_block(current.l2_block_number, block_interval)
             else {
@@ -143,13 +137,6 @@ impl ProofDispatcher {
             image_hash: self.config.tee_image_hash,
         };
 
-        info!(
-            from_block = recovered.l2_block_number,
-            to_block = target_block,
-            l1_head_number = l1_head.number,
-            "Built proof request"
-        );
-
         let request = ProposerProofAdapter::tee_prove_block_range_request(request);
         let expected_session_id = request.proof.session_id.clone();
 
@@ -179,12 +166,12 @@ impl ProofDispatcher {
             }
         };
 
-        debug!(session_id = %session_id, "dispatched TEE proof request");
         Metrics::proof_dispatch_total(Metrics::DISPATCH_OUTCOME_ACCEPTED).increment(1);
         info!(
             target_block,
             session_id = %session_id,
             from_block = recovered.l2_block_number,
+            l1_head_number = l1_head.number,
             "Proof request accepted by prover service"
         );
         true
@@ -261,9 +248,8 @@ mod tests {
     async fn tick_dispatches_all_targets_up_to_safe_head() {
         let (dispatcher, requester) = dispatcher();
         let mut cursor = None;
-        let cancel = CancellationToken::new();
 
-        dispatcher.tick(&mut cursor, recovered(), 400, 100, &cancel).await;
+        dispatcher.tick(&mut cursor, recovered(), 400, 100).await;
 
         assert_eq!(requester.requests.lock().unwrap().len(), 3);
         assert_eq!(cursor.map(|(_, cursor)| cursor.l2_block_number), Some(400));
@@ -272,7 +258,6 @@ mod tests {
     #[tokio::test]
     async fn tick_resets_cursor_when_recovery_rewinds() {
         let (dispatcher, requester) = dispatcher();
-        let cancel = CancellationToken::new();
         let mut cursor = Some((
             RecoveredState {
                 parent_address: Address::repeat_byte(0x01),
@@ -286,7 +271,7 @@ mod tests {
             },
         ));
 
-        dispatcher.tick(&mut cursor, recovered(), 200, 100, &cancel).await;
+        dispatcher.tick(&mut cursor, recovered(), 200, 100).await;
 
         assert_eq!(cursor.map(|(source, _)| source), Some(recovered()));
         assert_eq!(cursor.map(|(_, cursor)| cursor.l2_block_number), Some(200));
