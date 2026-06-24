@@ -215,18 +215,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_sends_root_derived_session() {
-        let (dispatcher, requester) = dispatcher();
-        let claimed_root = B256::repeat_byte(0xaa);
-
-        let outcome = dispatcher.dispatch(200, &recovered(), claimed_root).await;
-        let session_id = ProposerProofAdapter::tee_session_id_for_root(claimed_root);
-
-        assert!(outcome);
-        assert!(requester.requests.lock().unwrap().contains_key(&session_id));
-    }
-
-    #[tokio::test]
     async fn dispatch_rejects_mismatched_session_id() {
         let (dispatcher, requester) = dispatcher();
         *requester.accepted_session_id.lock().unwrap() = Some("wrong-session".to_owned());
@@ -254,7 +242,10 @@ mod tests {
 
         dispatcher.tick(&mut cursor, recovered(), 400, 100).await;
 
-        assert_eq!(requester.requests.lock().unwrap().len(), 3);
+        let requests = requester.requests.lock().unwrap();
+        let session_id = ProposerProofAdapter::tee_session_id_for_root(B256::repeat_byte(200));
+        assert_eq!(requests.len(), 3);
+        assert!(requests.contains_key(&session_id));
         assert_eq!(cursor.map(|(_, cursor)| cursor.l2_block_number), Some(400));
     }
 
