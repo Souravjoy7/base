@@ -58,6 +58,7 @@ impl ProverServiceServer {
             return Ok(Some(ProofResult::Compressed(ZkProofResult {
                 zk_vm: ZkVm::Sp1,
                 proof: Vec::new().into(),
+                execution_stats: None,
             })));
         }
 
@@ -174,6 +175,7 @@ mod tests {
         let stored_result = ProofResult::Compressed(ZkProofResult {
             zk_vm: ZkVm::Sp1,
             proof: vec![0xAA, 0xBB].into(),
+            execution_stats: None,
         });
         let mut req = make_proof_request(ProofType::OpSuccinctSp1ClusterCompressed, None, None);
         req.result_payload =

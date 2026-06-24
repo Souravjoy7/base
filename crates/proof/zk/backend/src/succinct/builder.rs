@@ -56,8 +56,8 @@ impl SuccinctZkProverBuildError {
 pub enum SuccinctZkBackendConfig {
     /// Return placeholder proof bytes without an external backend.
     Mock,
-    /// Return empty proof bytes without an external backend.
-    DryRun,
+    /// Generate a witness and run local SP1 execution without producing proof bytes.
+    DryRun(SuccinctRpcConfig),
     /// Submit proofs to an SP1 cluster.
     Cluster(SuccinctClusterBackendConfig),
     /// Submit proofs to the Succinct SP1 Network.
@@ -102,7 +102,9 @@ impl SuccinctZkProverBuilder {
 
         match self.config {
             SuccinctZkBackendConfig::Mock => Ok(Some(Arc::new(MockZkProver))),
-            SuccinctZkBackendConfig::DryRun => Ok(Some(Arc::new(DryRunZkProver))),
+            SuccinctZkBackendConfig::DryRun(rpc) => {
+                DryRunZkProver::build_until_cancelled(rpc, cancel).await
+            }
             SuccinctZkBackendConfig::Cluster(config) => {
                 ClusterZkProver::build_until_cancelled(config, cancel).await
             }
