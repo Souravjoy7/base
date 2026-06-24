@@ -73,6 +73,7 @@ impl ProofDispatcher {
             .cursor
             .filter(|(source, _)| *source == recovered)
             .map_or(recovered, |(_, cursor)| cursor);
+
         loop {
             if cancel.is_cancelled() {
                 break;
@@ -83,6 +84,7 @@ impl ProofDispatcher {
             else {
                 break;
             };
+
             if target_block > safe_head {
                 debug!(
                     current_block = current.l2_block_number,
@@ -148,6 +150,7 @@ impl ProofDispatcher {
             l1_head_number: l1_head.number,
             image_hash: self.config.tee_image_hash,
         };
+
         info!(
             from_block = recovered.l2_block_number,
             to_block = target_block,
