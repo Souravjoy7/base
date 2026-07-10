@@ -62,7 +62,8 @@ impl RawSpanBatch {
                 == 1
                 && i > 0
             {
-                l1_origin_number -= 1;
+                l1_origin_number = l1_origin_number.checked_sub(1)
+                    .ok_or(SpanBatchError::Decoding(SpanDecodingError::L1OriginCheck))?;
             }
         }
 
